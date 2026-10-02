@@ -175,9 +175,7 @@ fn close_raw_fd(fd: std::os::unix::io::RawFd) -> std::result::Result<(), io::Err
 /// The handle must be one the caller owns (and so is not closed again elsewhere)
 /// or one that is not valid.
 #[cfg(target_family = "windows")]
-fn close_raw_handle(
-    handle: std::os::windows::io::RawHandle,
-) -> std::result::Result<(), io::Error> {
+fn close_raw_handle(handle: std::os::windows::io::RawHandle) -> std::result::Result<(), io::Error> {
     // SAFETY: per this function's contract, `handle` is owned by the caller or invalid.
     match unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } {
         0 => Err(io::Error::last_os_error()),
