@@ -142,23 +142,46 @@ impl From<Error> for super::Error {
 fn close_file(file: File) -> std::result::Result<(), io::Error> {
     #[cfg(target_family = "unix")]
     {
-        nix::unistd::close(file).map_err(|e| e.into())
+        use std::os::unix::io::IntoRawFd;
+        close_raw_fd(file.into_raw_fd())
     }
     #[cfg(target_family = "windows")]
     {
         use std::os::windows::io::IntoRawHandle;
-
-        let handle = file.into_raw_handle();
-        // SAFETY: `handle` is a valid, owned handle obtained from `into_raw_handle()`.
-        match unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } {
-            0 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
-        }
+        close_raw_handle(file.into_raw_handle())
     }
     #[cfg(not(any(target_family = "unix", target_family = "windows")))]
     {
         drop(file);
         Ok(())
+    }
+}
+
+/// Close a raw file descriptor, returning the error `close()` reports.
+///
+/// The descriptor must be one the caller owns (and so is not closed again elsewhere)
+/// or one that is not open.
+#[cfg(target_family = "unix")]
+fn close_raw_fd(fd: std::os::unix::io::RawFd) -> std::result::Result<(), io::Error> {
+    // SAFETY: per this function's contract, `fd` is owned by the caller or not open.
+    match unsafe { nix::libc::close(fd) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Close a raw handle, returning the error `CloseHandle` reports.
+///
+/// The handle must be one the caller owns (and so is not closed again elsewhere)
+/// or one that is not valid.
+#[cfg(target_family = "windows")]
+fn close_raw_handle(
+    handle: std::os::windows::io::RawHandle,
+) -> std::result::Result<(), io::Error> {
+    // SAFETY: per this function's contract, `handle` is owned by the caller or invalid.
+    match unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } {
+        0 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
     }
 }
 
@@ -2019,37 +2042,33 @@ mod tests {
     #[test]
     #[cfg(target_family = "unix")]
     fn test_close_file_detects_error_unix() {
-        use std::os::fd::FromRawFd;
-        use std::os::unix::io::AsRawFd;
-
-        let file = tempfile::tempfile().unwrap();
-
-        // Close and reclaim a File from the now-invalid fd
-        let file = {
-            let fd = file.as_raw_fd();
-            super::close_file(file).unwrap();
-            unsafe { std::fs::File::from_raw_fd(fd) }
+        // A descriptor at or above the open-file limit can never be open, so closing
+        // it fails without any risk of closing a descriptor another test is using.
+        let mut limit = nix::libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
         };
+        // SAFETY: `limit` is a valid, writable rlimit.
+        assert_eq!(
+            unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let never_open = std::os::unix::io::RawFd::try_from(limit.rlim_cur)
+            .unwrap_or(std::os::unix::io::RawFd::MAX);
 
-        let err = super::close_file(file).unwrap_err();
+        let err = super::close_raw_fd(never_open).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(nix::libc::EBADF), "got: {err:?}");
+
+        // A real file still closes cleanly.
+        super::close_file(tempfile::tempfile().unwrap()).unwrap();
     }
 
     #[test]
     #[cfg(target_family = "windows")]
     fn test_close_file_detects_error_windows() {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle};
-
-        let file = tempfile::tempfile().unwrap();
-
-        // Close and reclaim a File from the now-invalid handle
-        let file = {
-            let handle = file.as_raw_handle();
-            super::close_file(file).unwrap();
-            unsafe { std::fs::File::from_raw_handle(handle) }
-        };
-
-        let err = super::close_file(file).unwrap_err();
+        // A null handle is never valid, so closing it fails without any risk of
+        // closing a handle another test is using.
+        let err = super::close_raw_handle(std::ptr::null_mut()).unwrap_err();
         assert_eq!(
             err.raw_os_error(),
             Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32),
