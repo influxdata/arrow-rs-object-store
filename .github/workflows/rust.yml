@@ -61,4 +61,6 @@ jobs:
       - name: Check
         run: |
           # run `cargo msrv verify` to see problems
-          cargo msrv verify --output-format=json || exit 1
+          # check all features too, so a dependency that only some features
+          # use (e.g. quick-xml for aws/azure/gcp) cannot raise the MSRV unnoticed
+          cargo msrv verify --output-format=json -- cargo check --all-features || exit 1
