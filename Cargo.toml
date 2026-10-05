@@ -24,7 +24,7 @@ readme = "README.md"
 description = "A generic object store interface for uniformly interacting with AWS S3, Google Cloud Storage, Azure Blob Storage and local files."
 keywords = ["object", "storage", "cloud"]
 repository = "https://github.com/apache/arrow-rs-object-store"
-rust-version = "1.64.0"
+rust-version = "1.79.0"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -51,7 +51,7 @@ http-body-util = { version = "0.1.2", optional = true }
 httparse = { version = "1.8.0", default-features = false, features = ["std"], optional = true }
 hyper = { version = "1.2", default-features = false, optional = true }
 md-5 = { version = "0.10.6", default-features = false, optional = true }
-quick-xml = { version = "0.38.0", features = ["serialize", "overlapped-lists"], optional = true }
+quick-xml = { version = "0.41.0", features = ["serialize", "overlapped-lists"], optional = true }
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"], optional = true }
 ring = { version = "0.17", default-features = false, features = ["std"], optional = true }
@@ -60,6 +60,12 @@ serde = { version = "1.0", default-features = false, features = ["derive"], opti
 serde_json = { version = "1.0", default-features = false, features = ["std"], optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 tokio = { version = "1.29.0", features = ["sync", "macros", "rt", "time", "io-util"] }
+
+[target.'cfg(target_family="unix")'.dependencies]
+nix = { version = "0.30.0", default-features = false, optional = true }
+
+[target.'cfg(target_family="windows")'.dependencies]
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation"], optional = true }
 
 [target.'cfg(target_family="unix")'.dev-dependencies]
 nix = { version = "0.30.0", features = ["fs"] }
@@ -72,7 +78,7 @@ wasm-bindgen-futures = "0.4.18"
 default = ["fs"]
 cloud = ["serde", "serde_json", "quick-xml", "hyper", "reqwest", "reqwest/stream", "chrono/serde", "base64", "rand", "ring", "http-body-util", "form_urlencoded", "serde_urlencoded"]
 azure = ["cloud", "httparse"]
-fs = ["walkdir"]
+fs = ["walkdir", "nix", "windows-sys"]
 gcp = ["cloud", "rustls-pemfile"]
 aws = ["cloud", "md-5"]
 http = ["cloud"]
