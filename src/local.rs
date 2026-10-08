@@ -1567,8 +1567,13 @@ mod tests {
         let integration = LocalFileSystem::new_with_prefix(root.path())
             .unwrap()
             .with_fsync(true);
-        let root = root.path().canonicalize().unwrap();
-        let (a, b) = (root.join("a"), root.join("a/b"));
+        // The store's own paths: `canonicalize` adds a `\\?\` prefix on Windows.
+        let first = integration
+            .path_to_filesystem(&Path::from("a/b/first"))
+            .unwrap();
+        let b = first.parent().unwrap().to_path_buf();
+        let a = b.parent().unwrap().to_path_buf();
+        let root = a.parent().unwrap().to_path_buf();
         let synced_under_root = || -> Vec<PathBuf> {
             let synced = SYNCED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
             synced
