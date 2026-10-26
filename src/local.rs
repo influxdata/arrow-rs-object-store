@@ -937,8 +937,8 @@ fn create_dir_all_durable(
 }
 
 /// Creates `dir` and its missing ancestors one at a time, as [`std::fs::create_dir_all`] does,
-/// registering each in `creating` before trying to create it and recording the ones that exist
-/// afterwards.
+/// registering each in `creating` before trying to create it and recording the deepest one that
+/// exists afterwards.
 fn create_dir_all_registering(
     dir: &std::path::Path,
     create: &mut impl FnMut(&std::path::Path) -> io::Result<()>,
@@ -949,7 +949,7 @@ fn create_dir_all_registering(
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) if !dir.is_dir() => return Err(e),
         _ => {
-            creating.reached.push(dir.to_path_buf());
+            creating.reached = Some(dir.to_path_buf());
             return Ok(());
         }
     }
@@ -960,7 +960,7 @@ fn create_dir_all_registering(
     match create(dir) {
         Err(e) if !dir.is_dir() => Err(e),
         _ => {
-            creating.reached.push(dir.to_path_buf());
+            creating.reached = Some(dir.to_path_buf());
             Ok(())
         }
     }
@@ -1105,13 +1105,14 @@ static DIRS: Mutex<DirRegistry> = Mutex::new(DirRegistry {
 });
 static DIRS_CHANGED: Condvar = Condvar::new();
 
-/// Registration in [`DIRS`], removed on drop. Unless `synced` is set by then, the directories
-/// reached are recorded as unsynced.
+/// Registration in [`DIRS`], removed on drop. Unless `synced` is set by then, the directory
+/// reached and the registered directories above it are recorded as unsynced.
 struct CreatingDirs {
     /// From the deepest up: the directories found missing, then the ones registered later.
     dirs: Vec<PathBuf>,
-    /// The registered directories that exist after this call's `create_dir`.
-    reached: Vec<PathBuf>,
+    /// The deepest registered directory that exists after this call's `create_dir`. The
+    /// registered directories above it existed then too, whoever made them: it is inside them.
+    reached: Option<PathBuf>,
     synced: bool,
 }
 
@@ -1123,7 +1124,7 @@ impl CreatingDirs {
         }
         Self {
             dirs,
-            reached: Vec::new(),
+            reached: None,
             synced: false,
         }
     }
@@ -1149,8 +1150,9 @@ impl Drop for CreatingDirs {
                 }
             }
         }
-        if !self.synced {
-            registry.unsynced.extend(self.reached.drain(..));
+        if let (false, Some(reached)) = (self.synced, &self.reached) {
+            let reached_and_above = self.dirs.iter().filter(|dir| reached.starts_with(dir));
+            registry.unsynced.extend(reached_and_above.cloned());
         }
         DIRS_CHANGED.notify_all();
     }
@@ -1923,6 +1925,58 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(unsynced_under(root), [n]);
+        assert!(synced.is_empty());
+    }
+
+    /// A creator the registry does not track makes `a` after this creation found it missing, so
+    /// this creation's `create_dir` never tries `a`. The sync that would have covered `a` and its
+    /// entry fails: `a` must be left to later writes too, or none of them syncs the root.
+    #[test]
+    fn fsync_failed_creation_records_a_directory_another_creator_made() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let a = root.join("a");
+        let b = a.join("b");
+
+        // `a` appears before the first `create_dir`; the first fsync fails.
+        create_dir_all_durable(
+            &b,
+            |dir| {
+                if dir == b {
+                    fs::create_dir(&a).unwrap();
+                }
+                fs::create_dir(dir)
+            },
+            |_| Err(io::Error::other("fsync failed")),
+        )
+        .unwrap_err();
+        assert_eq!(unsynced_under(root), [a.clone(), b.clone()]);
+
+        let mut synced = Vec::new();
+        fsync_parent_dir_with(&b.join("first"), recording(&mut synced)).unwrap();
+        assert_eq!(synced, [b.clone(), a.clone(), root.to_path_buf()]);
+        assert!(unsynced_under(root).is_empty());
+
+        // The same with the creation failing after it made `a/b`: `a/b/c` appears as a file
+        // before its `create_dir`. `a` was made by someone else again.
+        let c = b.join("c");
+        fs::remove_dir(&b).unwrap();
+        fs::remove_dir(&a).unwrap();
+        let mut synced = Vec::new();
+        create_dir_all_durable(
+            &c,
+            |dir| {
+                if dir == c && !a.exists() {
+                    fs::create_dir(&a).unwrap();
+                } else if dir == c {
+                    fs::write(&c, "x").unwrap();
+                }
+                fs::create_dir(dir)
+            },
+            recording(&mut synced),
+        )
+        .unwrap_err();
+        assert_eq!(unsynced_under(root), [a, b]);
         assert!(synced.is_empty());
     }
 
