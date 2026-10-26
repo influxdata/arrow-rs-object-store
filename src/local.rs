@@ -334,7 +334,10 @@ impl LocalFileSystem {
     /// matching directories by path within this process. Writes from other processes, or
     /// through another path to the same directory (a symlink, or different case on a
     /// case-insensitive filesystem), are not coordinated and can return before the new
-    /// directory's entry is durable.
+    /// directory's entry is durable. For the same reason, stores with different `fsync`
+    /// settings must not share a root within one process: a directory another store created
+    /// without fsync is not recorded, so neither a durable write into it nor a creation beneath
+    /// it syncs that directory's entry in its parent.
     pub fn with_fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
         self
