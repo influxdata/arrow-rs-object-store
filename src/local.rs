@@ -25,7 +25,7 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::{collections::BTreeSet, io};
+use std::{collections::BTreeMap, collections::BTreeSet, io};
 use std::{collections::VecDeque, path::PathBuf};
 
 use async_trait::async_trait;
@@ -44,7 +44,7 @@ use crate::{
     path::{Path, absolute_path_to_url},
     util::InvalidGetRange,
 };
-use crate::{CopyMode, CopyOptions, ObjectStoreExt, RenameOptions, RenameTargetMode};
+use crate::{CopyMode, CopyOptions, RenameOptions, RenameTargetMode};
 
 /// A specialized `Error` for filesystem object store-related errors
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +114,9 @@ pub(crate) enum Error {
     #[error("Filenames containing trailing '/#\\d+/' are not supported: {}", path)]
     InvalidPath { path: String },
 
+    #[error("Unable to sync data to disk for {}: {}", path.display(), source)]
+    UnableToSyncFile { source: io::Error, path: PathBuf },
+
     #[error("Upload aborted")]
     Aborted,
 }
@@ -134,6 +137,53 @@ impl From<Error> for super::Error {
                 source: Box::new(source),
             },
         }
+    }
+}
+
+/// Explicitly close a file, checking for errors that would be silently ignored by Rust's `File::drop()`.
+///
+/// On network filesystems (e.g. NFS), `close()` can fail and indicate data loss.
+fn close_file(file: File) -> std::result::Result<(), io::Error> {
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::io::IntoRawFd;
+        close_raw_fd(file.into_raw_fd())
+    }
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::io::IntoRawHandle;
+        close_raw_handle(file.into_raw_handle())
+    }
+    #[cfg(not(any(target_family = "unix", target_family = "windows")))]
+    {
+        drop(file);
+        Ok(())
+    }
+}
+
+/// Close a raw file descriptor, returning the error `close()` reports.
+///
+/// The descriptor must be one the caller owns (and so is not closed again elsewhere)
+/// or one that is not open.
+#[cfg(target_family = "unix")]
+fn close_raw_fd(fd: std::os::unix::io::RawFd) -> std::result::Result<(), io::Error> {
+    // SAFETY: per this function's contract, `fd` is owned by the caller or not open.
+    match unsafe { nix::libc::close(fd) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Close a raw handle, returning the error `CloseHandle` reports.
+///
+/// The handle must be one the caller owns (and so is not closed again elsewhere)
+/// or one that is not valid.
+#[cfg(target_family = "windows")]
+fn close_raw_handle(handle: std::os::windows::io::RawHandle) -> std::result::Result<(), io::Error> {
+    // SAFETY: per this function's contract, `handle` is owned by the caller or invalid.
+    match unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) } {
+        0 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
     }
 }
 
@@ -202,6 +252,8 @@ pub struct LocalFileSystem {
     config: Arc<Config>,
     // if you want to delete empty directories when deleting files
     automatic_cleanup: bool,
+    // if true, fsync written files and their parent directories after writes
+    fsync: bool,
 }
 
 #[derive(Debug)]
@@ -229,6 +281,7 @@ impl LocalFileSystem {
                 root: Url::parse("file:///").unwrap(),
             }),
             automatic_cleanup: false,
+            fsync: false,
         }
     }
 
@@ -247,6 +300,7 @@ impl LocalFileSystem {
                 root: absolute_path_to_url(path)?,
             }),
             automatic_cleanup: false,
+            fsync: false,
         })
     }
 
@@ -258,6 +312,31 @@ impl LocalFileSystem {
     /// Enable automatic cleanup of empty directories when deleting files
     pub fn with_automatic_cleanup(mut self, automatic_cleanup: bool) -> Self {
         self.automatic_cleanup = automatic_cleanup;
+        self
+    }
+
+    /// Enable `fsync` after writes for durability
+    ///
+    /// When enabled, [`LocalFileSystem`] calls [`File::sync_all`] on written files and fsyncs
+    /// the affected parent directories before a write operation
+    /// ([`put_opts`](ObjectStore::put_opts), [`copy_opts`](ObjectStore::copy_opts),
+    /// [`rename_opts`](ObjectStore::rename_opts), and multipart upload completion) returns
+    /// success. This guarantees that both the file contents and the directory entries pointing
+    /// to them are durable on stable storage, matching the implicit durability contract of
+    /// remote object stores such as S3 or GCS.
+    ///
+    /// This trades write throughput for durability and is **disabled by default**.
+    ///
+    /// Note that directory fsync is only performed on Unix; on other platforms (e.g. Windows)
+    /// it is a no-op, as directories cannot be portably opened and synced.
+    ///
+    /// A write into a directory that another write is still creating waits for that creation,
+    /// matching directories by path within this process. Writes from other processes, or
+    /// through another path to the same directory (a symlink, or different case on a
+    /// case-insensitive filesystem), are not coordinated and can return before the new
+    /// directory's entry is durable.
+    pub fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
         self
     }
 }
@@ -348,8 +427,9 @@ impl ObjectStore for LocalFileSystem {
         }
 
         let path = self.path_to_filesystem(location)?;
+        let fsync = self.fsync;
         maybe_spawn_blocking(move || {
-            let (mut file, staging_path) = new_staged_upload(&path)?;
+            let (mut file, staging_path) = new_staged_upload(&path, fsync)?;
             let mut e_tag = None;
 
             let err = match payload.iter().try_for_each(|x| file.write_all(x)) {
@@ -359,38 +439,26 @@ impl ObjectStore for LocalFileSystem {
                         path: path.to_string_lossy().to_string(),
                     })?;
                     e_tag = Some(get_etag(&metadata));
+                    // Atomically publish the staged file. When fsync is enabled the publish
+                    // helpers flush the file's contents and the destination's parent directory to
+                    // disk first, so a successful return is durable; the fsync calls are bundled
+                    // into the helpers so a file-system modification can never be left unsynced.
                     match opts.mode {
                         PutMode::Overwrite => {
-                            // For some fuse types of file systems, the file must be closed first
-                            // to trigger the upload operation, and then renamed, such as Blobfuse
-                            std::mem::drop(file);
-                            match std::fs::rename(&staging_path, &path) {
-                                Ok(_) => None,
-                                Err(source) => Some(Error::UnableToRenameFile { source }),
-                            }
+                            finish_staged_rename(file, &staging_path, &path, fsync).err()
                         }
-                        PutMode::Create => match std::fs::hard_link(&staging_path, &path) {
-                            Ok(_) => {
-                                let _ = std::fs::remove_file(&staging_path); // Attempt to cleanup
-                                None
-                            }
-                            Err(source) => match source.kind() {
-                                ErrorKind::AlreadyExists => Some(Error::AlreadyExists {
-                                    path: path.to_str().unwrap().to_string(),
-                                    source,
-                                }),
-                                _ => Some(Error::UnableToRenameFile { source }),
-                            },
-                        },
+                        PutMode::Create => {
+                            finish_staged_hard_link(file, &staging_path, &path, fsync).err()
+                        }
                         PutMode::Update(_) => unreachable!(),
                     }
                 }
-                Err(source) => Some(Error::UnableToCopyDataToFile { source }),
+                Err(source) => Some(Error::UnableToCopyDataToFile { source }.into()),
             };
 
             if let Some(err) = err {
                 let _ = std::fs::remove_file(&staging_path); // Attempt to cleanup
-                return Err(err.into());
+                return Err(err);
             }
 
             Ok(PutResult {
@@ -414,8 +482,8 @@ impl ObjectStore for LocalFileSystem {
         }
 
         let dest = self.path_to_filesystem(location)?;
-        let (file, src) = new_staged_upload(&dest)?;
-        Ok(Box::new(LocalUpload::new(src, dest, file)))
+        let (file, src) = new_staged_upload(&dest, self.fsync)?;
+        Ok(Box::new(LocalUpload::new(src, dest, file, self.fsync)))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -470,7 +538,9 @@ impl ObjectStore for LocalFileSystem {
                 let config = Arc::clone(&config);
                 maybe_spawn_blocking(move || {
                     let location = location?;
-                    Self::delete_location(config, automatic_cleanup, &location)?;
+                    // `with_fsync` does not apply to standalone deletes; only create-mode rename
+                    // fsyncs its internal source removal as part of the durable copy-and-delete.
+                    Self::delete_location(config, automatic_cleanup, &location, false)?;
                     Ok(location)
                 })
             })
@@ -549,6 +619,7 @@ impl ObjectStore for LocalFileSystem {
 
         let from = self.path_to_filesystem(from)?;
         let to = self.path_to_filesystem(to)?;
+        let fsync = self.fsync;
 
         match mode {
             CopyMode::Overwrite => {
@@ -562,17 +633,22 @@ impl ObjectStore for LocalFileSystem {
                 maybe_spawn_blocking(move || {
                     loop {
                         let staged = staged_upload_path(&to, &id.to_string());
+                        // Stage via a temporary hard link; the source is already durable so the
+                        // staging link itself needs no fsync (the publish rename below fsyncs the
+                        // shared parent directory).
                         match std::fs::hard_link(&from, &staged) {
-                            Ok(_) => {
-                                return std::fs::rename(&staged, &to).map_err(|source| {
+                            // `rename` bundles in the fsync of `to`'s parent directory.
+                            Ok(_) => match rename(&staged, &to, fsync) {
+                                Ok(_) => return Ok(()),
+                                Err(source) => {
                                     let _ = std::fs::remove_file(&staged); // Attempt to clean up
-                                    Error::UnableToCopyFile { from, to, source }.into()
-                                });
-                            }
+                                    return Err(Error::UnableToCopyFile { from, to, source }.into());
+                                }
+                            },
                             Err(source) => match source.kind() {
                                 ErrorKind::AlreadyExists => id += 1,
                                 ErrorKind::NotFound => match from.exists() {
-                                    true => create_parent_dirs(&to, source)?,
+                                    true => create_parent_dirs(&to, source, fsync)?,
                                     false => {
                                         return Err(Error::NotFound { path: from, source }.into());
                                     }
@@ -589,7 +665,9 @@ impl ObjectStore for LocalFileSystem {
             CopyMode::Create => {
                 maybe_spawn_blocking(move || {
                     loop {
-                        match std::fs::hard_link(&from, &to) {
+                        // The source is an existing object that is already durable, so no file
+                        // sync is needed; `hard_link` bundles in the fsync of `to`'s parent dir.
+                        match hard_link(&from, &to, fsync) {
                             Ok(_) => return Ok(()),
                             Err(source) => match source.kind() {
                                 ErrorKind::AlreadyExists => {
@@ -600,7 +678,7 @@ impl ObjectStore for LocalFileSystem {
                                     .into());
                                 }
                                 ErrorKind::NotFound => match from.exists() {
-                                    true => create_parent_dirs(&to, source)?,
+                                    true => create_parent_dirs(&to, source, fsync)?,
                                     false => {
                                         return Err(Error::NotFound { path: from, source }.into());
                                     }
@@ -628,13 +706,18 @@ impl ObjectStore for LocalFileSystem {
             RenameTargetMode::Overwrite => {
                 let from = self.path_to_filesystem(from)?;
                 let to = self.path_to_filesystem(to)?;
+                let fsync = self.fsync;
                 maybe_spawn_blocking(move || {
                     loop {
-                        match std::fs::rename(&from, &to) {
+                        // Unlike multipart `complete`, there is no freshly written file to
+                        // `sync_all` here: `from` is an existing, already-durable object and a
+                        // rename only mutates directory entries. `rename` bundles in the fsync of
+                        // both affected directories (destination, and source if it differs).
+                        match rename(&from, &to, fsync) {
                             Ok(_) => return Ok(()),
                             Err(source) => match source.kind() {
                                 ErrorKind::NotFound => match from.exists() {
-                                    true => create_parent_dirs(&to, source)?,
+                                    true => create_parent_dirs(&to, source, fsync)?,
                                     false => {
                                         return Err(Error::NotFound { path: from, source }.into());
                                     }
@@ -659,7 +742,14 @@ impl ObjectStore for LocalFileSystem {
                     },
                 )
                 .await?;
-                self.delete(from).await?;
+                let config = Arc::clone(&self.config);
+                let automatic_cleanup = self.automatic_cleanup;
+                let fsync = self.fsync;
+                let from = from.clone();
+                maybe_spawn_blocking(move || {
+                    Self::delete_location(config, automatic_cleanup, &from, fsync)
+                })
+                .await?;
                 Ok(())
             }
         }
@@ -671,6 +761,7 @@ impl LocalFileSystem {
         config: Arc<Config>,
         automatic_cleanup: bool,
         location: &Path,
+        fsync: bool,
     ) -> Result<()> {
         let path = config.path_to_filesystem(location)?;
         if let Err(e) = std::fs::remove_file(&path) {
@@ -678,7 +769,18 @@ impl LocalFileSystem {
                 ErrorKind::NotFound => Error::NotFound { path, source: e }.into(),
                 _ => Error::UnableToDeleteFile { path, source: e }.into(),
             })
-        } else if automatic_cleanup {
+        } else {
+            if fsync {
+                fsync_parent_dir(&path).map_err(|source| Error::UnableToSyncFile {
+                    source,
+                    path: path.clone(),
+                })?;
+            }
+
+            if !automatic_cleanup {
+                return Ok(());
+            }
+
             let root = &config.root;
             let root = root
                 .to_file_path()
@@ -695,8 +797,6 @@ impl LocalFileSystem {
                 }
             }
 
-            Ok(())
-        } else {
             Ok(())
         }
     }
@@ -786,23 +886,274 @@ impl LocalFileSystem {
 }
 
 /// Creates the parent directories of `path` or returns an error based on `source` if no parent
-fn create_parent_dirs(path: &std::path::Path, source: io::Error) -> Result<()> {
+///
+/// When `fsync` is true, every directory created here is fsynced, up to and including the first
+/// pre-existing ancestor (whose entry list also changed), so the new directory entries are durable.
+fn create_parent_dirs(path: &std::path::Path, source: io::Error, fsync: bool) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         let path = path.to_path_buf();
         Error::UnableToCreateFile { path, source }
     })?;
 
+    // Record the deepest already-existing ancestor *before* creating any directories, so that
+    // afterwards we know exactly which directories are new and need to be fsynced. Registering
+    // them makes concurrent writes into them wait for those fsyncs.
+    let mut creating = None;
+    let first_existing = fsync.then(|| {
+        let mut new_dirs = Vec::new();
+        let mut dir = parent;
+        while !dir.exists() {
+            new_dirs.push(dir.to_path_buf());
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+        creating = Some(CreatingDirs::register(new_dirs));
+        dir.to_path_buf()
+    });
+
     std::fs::create_dir_all(parent).map_err(|source| {
         let path = parent.into();
         Error::UnableToCreateDir { source, path }
     })?;
+
+    if let Some(first_existing) = first_existing {
+        // Walk from `parent` up to `first_existing`, fsyncing each directory whose entries changed.
+        let mut dir = parent;
+        loop {
+            fsync_dir(dir).map_err(|source| Error::UnableToSyncFile {
+                source,
+                path: dir.into(),
+            })?;
+            if dir == first_existing {
+                break;
+            }
+            dir = match dir.parent() {
+                Some(p) => p,
+                None => break,
+            };
+        }
+    }
+    if let Some(creating) = &mut creating {
+        creating.synced = true;
+    }
     Ok(())
+}
+
+/// Renames `from` to `to`, then — when `fsync` is enabled — fsyncs the destination's parent
+/// directory (and the source's too, if it differs) so the moved directory entries are durable.
+///
+/// The directory fsync is bundled in deliberately: every durable rename goes through here, so the
+/// post-rename fsync can never be forgotten at an individual call site.
+fn rename(from: &std::path::Path, to: &std::path::Path, fsync: bool) -> io::Result<()> {
+    std::fs::rename(from, to)?;
+    if fsync {
+        fsync_parent_dir(to)?;
+        // A cross-directory move also removes an entry from the source directory.
+        if from.parent() != to.parent() {
+            fsync_parent_dir(from)?;
+        }
+    }
+    Ok(())
+}
+
+/// Hard-links `original` to `link`, then — when `fsync` is enabled — fsyncs `link`'s parent
+/// directory so the new directory entry is durable.
+///
+/// As with [`rename`], the directory fsync is bundled in so it cannot be forgotten at a call site.
+fn hard_link(original: &std::path::Path, link: &std::path::Path, fsync: bool) -> io::Result<()> {
+    std::fs::hard_link(original, link)?;
+    if fsync {
+        fsync_parent_dir(link)?;
+    }
+    Ok(())
+}
+
+/// Durably publishes the freshly-written staging file `file` (located at `src`) to `dest` via a
+/// rename.
+///
+/// When `fsync` is enabled, the file's contents are flushed before — and `dest`'s parent
+/// directory after — the rename, so a successful return is durable. The file is always closed
+/// before the rename (checking for close errors): required for NFS error detection and for some
+/// FUSE filesystems (e.g. Blobfuse) that only commit the data on close.
+fn finish_staged_rename(
+    file: File,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    fsync: bool,
+) -> Result<()> {
+    sync_and_close(file, src, fsync)?;
+    rename(src, dest, fsync).map_err(|source| Error::UnableToRenameFile { source })?;
+    Ok(())
+}
+
+/// Like [`finish_staged_rename`] but publishes via a hard link (`PutMode::Create` semantics): the
+/// staging file is linked to `dest` and then removed. Returns [`Error::AlreadyExists`] if `dest`
+/// already exists.
+fn finish_staged_hard_link(
+    file: File,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    fsync: bool,
+) -> Result<()> {
+    sync_and_close(file, src, fsync)?;
+    match hard_link(src, dest, fsync) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(src); // Attempt to cleanup
+            Ok(())
+        }
+        Err(source) => match source.kind() {
+            ErrorKind::AlreadyExists => Err(Error::AlreadyExists {
+                path: dest.to_str().unwrap().to_string(),
+                source,
+            }
+            .into()),
+            _ => Err(Error::UnableToRenameFile { source }.into()),
+        },
+    }
+}
+
+/// Flushes the freshly-written `file`'s contents to disk (when `fsync` is enabled) and then
+/// closes it, checking for close errors that dropping the [`File`] would silently ignore.
+fn sync_and_close(file: File, path: &std::path::Path, fsync: bool) -> Result<()> {
+    if fsync {
+        file.sync_all().map_err(|source| Error::UnableToSyncFile {
+            source,
+            path: path.into(),
+        })?;
+    }
+    close_file(file).map_err(|source| Error::UnableToCopyDataToFile { source })?;
+    Ok(())
+}
+
+/// Directories [`create_parent_dirs`] is creating and fsyncing, with the number of calls doing
+/// so, and directories a creation could not fsync. A durable write into one waits for, or makes,
+/// them durable before returning.
+struct DirRegistry {
+    creating: BTreeMap<PathBuf, usize>,
+    unsynced: BTreeSet<PathBuf>,
+}
+
+static DIRS: std::sync::Mutex<DirRegistry> = std::sync::Mutex::new(DirRegistry {
+    creating: BTreeMap::new(),
+    unsynced: BTreeSet::new(),
+});
+static DIRS_CREATED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn lock_dirs() -> std::sync::MutexGuard<'static, DirRegistry> {
+    DIRS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Registration in [`DIRS`], removed on drop. Unless `synced` is set, the directories are then
+/// recorded as unsynced.
+struct CreatingDirs {
+    dirs: Vec<PathBuf>,
+    synced: bool,
+}
+
+impl CreatingDirs {
+    fn register(dirs: Vec<PathBuf>) -> Self {
+        let mut registry = lock_dirs();
+        for dir in &dirs {
+            *registry.creating.entry(dir.clone()).or_default() += 1;
+        }
+        Self {
+            dirs,
+            synced: false,
+        }
+    }
+}
+
+impl Drop for CreatingDirs {
+    fn drop(&mut self) {
+        let mut registry = lock_dirs();
+        for dir in &self.dirs {
+            if let Some(count) = registry.creating.get_mut(dir) {
+                *count -= 1;
+                if *count == 0 {
+                    registry.creating.remove(dir);
+                }
+            }
+            if !self.synced {
+                registry.unsynced.insert(dir.clone());
+            }
+        }
+        DIRS_CREATED.notify_all();
+    }
+}
+
+/// Waits until no ancestor directory of `path` is being created. Returns the highest ancestor
+/// left unsynced, if any.
+fn wait_for_ancestor_creation(path: &std::path::Path) -> Option<PathBuf> {
+    let mut registry = lock_dirs();
+    while path
+        .ancestors()
+        .skip(1)
+        .any(|dir| registry.creating.contains_key(dir))
+    {
+        registry = DIRS_CREATED
+            .wait(registry)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    path.ancestors()
+        .skip(1)
+        .filter(|dir| registry.unsynced.contains(*dir))
+        .last()
+        .map(PathBuf::from)
+}
+
+/// Fsyncs the parent directory of `path` so a change to its directory entries (e.g. one just made
+/// by a rename or hard link) is durable, along with any unsynced ancestors and their parents.
+/// A no-op when `path` has no parent.
+fn fsync_parent_dir(path: &std::path::Path) -> io::Result<()> {
+    let unsynced = wait_for_ancestor_creation(path);
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let highest = unsynced
+        .as_deref()
+        .and_then(|dir| dir.parent())
+        .unwrap_or(parent);
+    for dir in parent.ancestors() {
+        fsync_dir(dir)?;
+        if dir == highest {
+            break;
+        }
+    }
+    if let Some(unsynced) = unsynced {
+        lock_dirs()
+            .unsynced
+            .retain(|dir| !(path.starts_with(dir) && dir.starts_with(&unsynced)));
+    }
+    Ok(())
+}
+
+/// Fsyncs `dir_path` so that changes to its directory entries are durable.
+///
+/// This is only meaningful on Unix; on other platforms (e.g. Windows) directories cannot be
+/// portably opened as a [`File`] and synced, so this is a no-op.
+fn fsync_dir(dir_path: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    tests::SYNCED_DIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir_path.to_path_buf());
+    #[cfg(target_family = "unix")]
+    {
+        File::open(dir_path)?.sync_all()
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = dir_path;
+        Ok(())
+    }
 }
 
 /// Generates a unique file path `{base}#{suffix}`, returning the opened `File` and `path`
 ///
-/// Creates any directories if necessary
-fn new_staged_upload(base: &std::path::Path) -> Result<(File, PathBuf)> {
+/// Creates any directories if necessary, fsyncing them when `fsync` is enabled
+fn new_staged_upload(base: &std::path::Path, fsync: bool) -> Result<(File, PathBuf)> {
     let mut multipart_id = 1;
     loop {
         let suffix = multipart_id.to_string();
@@ -812,7 +1163,7 @@ fn new_staged_upload(base: &std::path::Path) -> Result<(File, PathBuf)> {
             Ok(f) => return Ok((f, path)),
             Err(source) => match source.kind() {
                 ErrorKind::AlreadyExists => multipart_id += 1,
-                ErrorKind::NotFound => create_parent_dirs(&path, source)?,
+                ErrorKind::NotFound => create_parent_dirs(&path, source, fsync)?,
                 _ => return Err(Error::UnableToOpenFile { source, path }.into()),
             },
         }
@@ -835,23 +1186,26 @@ struct LocalUpload {
     src: Option<PathBuf>,
     /// The next offset to write into the file
     offset: u64,
+    /// Whether to fsync the file and its parent directory on completion
+    fsync: bool,
 }
 
 #[derive(Debug)]
 struct UploadState {
     dest: PathBuf,
-    file: Mutex<File>,
+    file: Mutex<Option<File>>,
 }
 
 impl LocalUpload {
-    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File) -> Self {
+    pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File, fsync: bool) -> Self {
         Self {
             state: Arc::new(UploadState {
                 dest,
-                file: Mutex::new(file),
+                file: Mutex::new(Some(file)),
             }),
             src: Some(src),
             offset: 0,
+            fsync,
         }
     }
 }
@@ -864,7 +1218,8 @@ impl MultipartUpload for LocalUpload {
 
         let s = Arc::clone(&self.state);
         maybe_spawn_blocking(move || {
-            let mut file = s.file.lock();
+            let mut guard = s.file.lock();
+            let file = guard.as_mut().ok_or(Error::Aborted)?;
             file.seek(SeekFrom::Start(offset)).map_err(|source| {
                 let path = s.dest.clone();
                 Error::Seek { source, path }
@@ -882,15 +1237,21 @@ impl MultipartUpload for LocalUpload {
     async fn complete(&mut self) -> Result<PutResult> {
         let src = self.src.take().ok_or(Error::Aborted)?;
         let s = Arc::clone(&self.state);
+        let fsync = self.fsync;
         maybe_spawn_blocking(move || {
             // Ensure no inflight writes
-            let file = s.file.lock();
-            std::fs::rename(&src, &s.dest)
-                .map_err(|source| Error::UnableToRenameFile { source })?;
+            let mut guard = s.file.lock();
+            let file = guard.take().ok_or(Error::Aborted)?;
+
             let metadata = file.metadata().map_err(|e| Error::Metadata {
                 source: e.into(),
                 path: src.to_string_lossy().to_string(),
             })?;
+
+            // Durably publish the freshly-written staging file: flush its contents, close it, then
+            // rename it into place and fsync the destination's parent directory (the fsync calls
+            // are bundled into the helper and only run when fsync is enabled).
+            finish_staged_rename(file, &src, &s.dest, fsync)?;
 
             Ok(PutResult {
                 e_tag: Some(get_etag(&metadata)),
@@ -1258,11 +1619,18 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(target_family = "unix")]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_family = "unix")]
     use tempfile::NamedTempFile;
 
     use crate::{ObjectStoreExt, integration::*};
 
     use super::*;
+
+    /// Every directory [`fsync_dir`] synced, across all tests.
+    pub(super) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> =
+        std::sync::Mutex::new(Vec::new());
 
     #[tokio::test]
     #[cfg(target_family = "unix")]
@@ -1280,6 +1648,200 @@ mod tests {
         copy_rename_nonexistent_object(&integration).await;
         stream_get(&integration).await;
         put_opts(&integration, false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(target_family = "unix")]
+    async fn file_test_fsync() {
+        // Run the full integration suite with fsync enabled to ensure the durability code
+        // paths (file sync + directory fsync on put/copy/rename/multipart, including recursive
+        // directory creation) behave identically to the default.
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path())
+            .unwrap()
+            .with_fsync(true);
+
+        put_get_delete_list(&integration).await;
+        list_with_offset_exclusivity(&integration).await;
+        get_opts(&integration).await;
+        list_uses_directories_correctly(&integration).await;
+        list_with_delimiter(&integration).await;
+        rename_and_copy(&integration).await;
+        copy_if_not_exists(&integration).await;
+        copy_rename_nonexistent_object(&integration).await;
+        stream_get(&integration).await;
+        put_opts(&integration, false).await;
+    }
+
+    #[tokio::test]
+    async fn fsync_write_waits_for_in_progress_dir_creation() {
+        let root = TempDir::new().unwrap();
+        let integration = Arc::new(
+            LocalFileSystem::new_with_prefix(root.path())
+                .unwrap()
+                .with_fsync(true),
+        );
+        integration
+            .put(&Path::from("a/first"), Bytes::from("1").into())
+            .await
+            .unwrap();
+        let dir_of = |location: &str| {
+            let path = integration
+                .path_to_filesystem(&Path::from(location))
+                .unwrap();
+            path.parent().unwrap().to_path_buf()
+        };
+
+        // Another write is still making `b` durable: a write into `a` does not wait.
+        let creating_b = CreatingDirs::register(vec![dir_of("b/x")]);
+        let second = Path::from("a/second");
+        let unrelated = integration.put(&second, Bytes::from("2").into());
+        tokio::time::timeout(std::time::Duration::from_secs(10), unrelated)
+            .await
+            .expect("not blocked by an unrelated directory")
+            .unwrap();
+        drop(creating_b);
+
+        // Another write is still making `a` durable: a write into `a` waits for it.
+        let creating_a = CreatingDirs::register(vec![dir_of("a/x")]);
+        let store = Arc::clone(&integration);
+        let write = tokio::spawn(async move {
+            store
+                .put(&Path::from("a/third"), Bytes::from("3").into())
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!write.is_finished(), "returned before `a` was durable");
+        drop(creating_a);
+        tokio::time::timeout(std::time::Duration::from_secs(10), write)
+            .await
+            .expect("woken once `a` is durable")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A creation that could not fsync its new directories leaves them to the next write
+    /// under them.
+    #[tokio::test]
+    async fn fsync_write_syncs_directories_a_failed_creation_left() {
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path())
+            .unwrap()
+            .with_fsync(true);
+        // The store's own paths: `canonicalize` adds a `\\?\` prefix on Windows.
+        let first = integration
+            .path_to_filesystem(&Path::from("a/b/first"))
+            .unwrap();
+        let b = first.parent().unwrap().to_path_buf();
+        let a = b.parent().unwrap().to_path_buf();
+        let root = a.parent().unwrap().to_path_buf();
+        let synced_under_root = || -> Vec<PathBuf> {
+            let synced = SYNCED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+            synced
+                .iter()
+                .filter(|dir| dir.starts_with(&root))
+                .cloned()
+                .collect()
+        };
+
+        // The creator stops after creating the directories, as if its first fsync failed.
+        let creating = CreatingDirs::register(vec![b.clone(), a.clone()]);
+        fs::create_dir_all(&b).unwrap();
+        drop(creating);
+
+        integration
+            .put(&Path::from("a/b/first"), Bytes::from("1").into())
+            .await
+            .unwrap();
+        let synced = synced_under_root();
+        for dir in [&b, &a, &root] {
+            assert!(synced.contains(dir), "{dir:?} not synced: {synced:?}");
+        }
+
+        // Once synced, they are no longer left to later writes.
+        integration
+            .put(&Path::from("a/b/second"), Bytes::from("2").into())
+            .await
+            .unwrap();
+        assert_eq!(synced_under_root()[synced.len()..], [b]);
+    }
+
+    #[tokio::test]
+    async fn fsync_creates_nested_dirs() {
+        // Exercises the recursive directory fsync in `create_parent_dirs`: every directory
+        // component is newly created, so each must be synced up to the pre-existing root.
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path())
+            .unwrap()
+            .with_fsync(true);
+
+        let data = Bytes::from("arbitrary data");
+
+        // `put` (overwrite) into a deeply nested, non-existent directory tree
+        let location = Path::from("a/b/c/d/put_file");
+        integration
+            .put(&location, data.clone().into())
+            .await
+            .unwrap();
+        let read = integration
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(read, data);
+
+        // multipart upload into another nested tree
+        let location = Path::from("e/f/g/multipart_file");
+        let mut upload = integration.put_multipart(&location).await.unwrap();
+        upload.put_part(data.clone().into()).await.unwrap();
+        upload.complete().await.unwrap();
+        let read = integration
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(read, data);
+    }
+
+    #[tokio::test]
+    #[cfg(target_family = "unix")]
+    async fn fsync_rename_if_not_exists_propagates_source_delete_sync_error() {
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path())
+            .unwrap()
+            .with_fsync(true);
+
+        let source = Path::from("source_dir/source_file");
+        let dest = Path::from("dest_dir/dest_file");
+        integration.put(&source, "data".into()).await.unwrap();
+
+        let source_dir = root.path().join("source_dir");
+        let original_permissions = fs::metadata(&source_dir).unwrap().permissions();
+        // Allow unlinking the file from the directory, but prevent opening the
+        // directory for fsync. Without the source-parent fsync, rename succeeds;
+        // with it, the sync error is propagated after the source is deleted.
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = integration.rename_if_not_exists(&source, &dest).await;
+        fs::set_permissions(&source_dir, original_permissions).unwrap();
+
+        match result {
+            Err(crate::Error::Generic { source, .. }) => {
+                assert!(source.to_string().contains("Unable to sync data to disk"));
+            }
+            _ => panic!("expected source parent fsync to fail"),
+        }
+
+        let read = integration.get(&dest).await.unwrap().bytes().await.unwrap();
+        assert_eq!(read, Bytes::from("data"));
+        assert!(matches!(
+            integration.get(&source).await.unwrap_err(),
+            crate::Error::NotFound { .. }
+        ));
     }
 
     #[test]
@@ -1846,6 +2408,43 @@ mod tests {
         assert!(fs::read_dir(root.path()).unwrap().count() > 0);
         integration.delete(&location).await.unwrap();
         assert!(fs::read_dir(root.path()).unwrap().count() == 0);
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn test_close_file_detects_error_unix() {
+        // A descriptor at or above the open-file limit can never be open, so closing
+        // it fails without any risk of closing a descriptor another test is using.
+        let mut limit = nix::libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid, writable rlimit.
+        assert_eq!(
+            unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let never_open = std::os::unix::io::RawFd::try_from(limit.rlim_cur)
+            .unwrap_or(std::os::unix::io::RawFd::MAX);
+
+        let err = super::close_raw_fd(never_open).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(nix::libc::EBADF), "got: {err:?}");
+
+        // A real file still closes cleanly.
+        super::close_file(tempfile::tempfile().unwrap()).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_family = "windows")]
+    fn test_close_file_detects_error_windows() {
+        // A null handle is never valid, so closing it fails without any risk of
+        // closing a handle another test is using.
+        let err = super::close_raw_handle(std::ptr::null_mut()).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32),
+            "got: {err:?}"
+        );
     }
 }
 
