@@ -1087,8 +1087,8 @@ fn lock_dirs() -> std::sync::MutexGuard<'static, DirRegistry> {
     DIRS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Registration in [`DIRS`], removed on drop. Unless `synced` is set, the directories are then
-/// recorded as unsynced.
+/// Registration in [`DIRS`], removed on drop. Unless `synced` is set, the directories that exist
+/// by then are recorded as unsynced.
 struct CreatingDirs {
     dirs: Vec<PathBuf>,
     synced: bool,
@@ -1118,6 +1118,20 @@ impl CreatingDirs {
 
 impl Drop for CreatingDirs {
     fn drop(&mut self) {
+        // A path that is not a directory has no entries to sync; recording it would keep it in the
+        // process-global set for good. One whose state cannot be determined might be one.
+        let unsynced: Vec<_> = if self.synced {
+            Vec::new()
+        } else {
+            self.dirs
+                .iter()
+                .filter(|dir| match std::fs::metadata(dir) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(e) => e.kind() != ErrorKind::NotFound,
+                })
+                .cloned()
+                .collect()
+        };
         let mut registry = lock_dirs();
         for dir in &self.dirs {
             if let Some(count) = registry.creating.get_mut(dir) {
@@ -1126,10 +1140,8 @@ impl Drop for CreatingDirs {
                     registry.creating.remove(dir);
                 }
             }
-            if !self.synced {
-                registry.unsynced.insert(dir.clone());
-            }
         }
+        registry.unsynced.extend(unsynced);
         DIRS_CREATED.notify_all();
     }
 }
@@ -1712,6 +1724,15 @@ mod tests {
             .collect()
     }
 
+    fn unsynced_under(root: &std::path::Path) -> Vec<PathBuf> {
+        lock_dirs()
+            .unsynced
+            .iter()
+            .filter(|dir| dir.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
     /// A concurrent delete with automatic cleanup removes an ancestor the creation found
     /// existing; the creation recreates it and must sync the directory holding its entry.
     #[tokio::test]
@@ -1794,6 +1815,35 @@ mod tests {
         for dir in [&z, &y, &x, &root] {
             assert!(synced.contains(dir), "{dir:?} not synced: {synced:?}");
         }
+    }
+
+    /// A creation that fails before creating anything leaves nothing for later writes.
+    #[tokio::test]
+    #[cfg(target_family = "unix")]
+    async fn fsync_failed_creation_records_only_directories_that_exist() {
+        let tmp = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(tmp.path())
+            .unwrap()
+            .with_fsync(true);
+        let unwritable = integration.path_to_filesystem(&Path::from("ro")).unwrap();
+        let root = unwritable.parent().unwrap().to_path_buf();
+        assert!(unsynced_under(&root).is_empty());
+
+        // `mkdir` under an unwritable directory fails with EACCES, having created nothing.
+        fs::create_dir(&unwritable).unwrap();
+        fs::set_permissions(&unwritable, fs::Permissions::from_mode(0o555)).unwrap();
+        for i in 0..50 {
+            let err = integration
+                .put(
+                    &Path::from(format!("ro/k{i}/file")),
+                    Bytes::from("x").into(),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Unable to create dir"), "{err}");
+        }
+        fs::set_permissions(&unwritable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(unsynced_under(&root), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]
