@@ -334,7 +334,10 @@ impl LocalFileSystem {
     /// matching directories by path within this process. Writes from other processes, or
     /// through another path to the same directory (a symlink, or different case on a
     /// case-insensitive filesystem), are not coordinated and can return before the new
-    /// directory's entry is durable.
+    /// directory's entry is durable. For the same reason, stores with different `fsync`
+    /// settings must not share a root within one process: a directory another store created
+    /// without fsync is not recorded, so neither a durable write into it nor a creation beneath
+    /// it syncs that directory's entry in its parent.
     pub fn with_fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
         self
@@ -887,58 +890,100 @@ impl LocalFileSystem {
 
 /// Creates the parent directories of `path` or returns an error based on `source` if no parent
 ///
-/// When `fsync` is true, every directory created here is fsynced, up to and including the first
-/// pre-existing ancestor (whose entry list also changed), so the new directory entries are durable.
+/// When `fsync` is true, every directory created here is fsynced, along with the directory holding
+/// each one's entry, so the new directory entries are durable.
 fn create_parent_dirs(path: &std::path::Path, source: io::Error, fsync: bool) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         let path = path.to_path_buf();
         Error::UnableToCreateFile { path, source }
     })?;
+    let create_dir_error = |source| Error::UnableToCreateDir {
+        source,
+        path: parent.into(),
+    };
 
-    // Record the deepest already-existing ancestor *before* creating any directories, so that
-    // afterwards we know exactly which directories are new and need to be fsynced. Registering
-    // them makes concurrent writes into them wait for those fsyncs.
-    let mut creating = None;
-    let first_existing = fsync.then(|| {
-        let mut new_dirs = Vec::new();
-        let mut dir = parent;
-        while !dir.exists() {
-            new_dirs.push(dir.to_path_buf());
-            match dir.parent() {
-                Some(p) => dir = p,
-                None => break,
-            }
+    if !fsync {
+        return Ok(std::fs::create_dir_all(parent).map_err(create_dir_error)?);
+    }
+
+    // Register the missing directories before creating any, so concurrent writes into them wait
+    // for their fsyncs.
+    let mut missing = Vec::new();
+    let mut dir = parent;
+    while !dir.exists() {
+        missing.push(dir.to_path_buf());
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
         }
-        creating = Some(CreatingDirs::register(new_dirs));
-        dir.to_path_buf()
-    });
+    }
+    let mut creating = CreatingDirs::register(missing);
 
-    std::fs::create_dir_all(parent).map_err(|source| {
-        let path = parent.into();
-        Error::UnableToCreateDir { source, path }
-    })?;
-
-    if let Some(first_existing) = first_existing {
-        // Walk from `parent` up to `first_existing`, fsyncing each directory whose entries changed.
-        let mut dir = parent;
-        loop {
+    // What exists can change between the check above and the creation (a concurrent delete with
+    // automatic cleanup removes emptied ancestors), so sync what this call created rather than
+    // what it found missing. Another caller may have created a directory in between the created
+    // ones; it holds an entry made here, so it is synced too.
+    let mut created = Vec::new();
+    create_dir_all_recording(parent, &mut creating, &mut created).map_err(create_dir_error)?;
+    if let (Some(highest), Some(deepest)) = (created.first(), created.last()) {
+        let holding_highest = highest.parent();
+        for dir in deepest.ancestors() {
             fsync_dir(dir).map_err(|source| Error::UnableToSyncFile {
                 source,
                 path: dir.into(),
             })?;
-            if dir == first_existing {
+            if Some(dir) == holding_highest {
                 break;
             }
-            dir = match dir.parent() {
-                Some(p) => p,
-                None => break,
-            };
         }
     }
-    if let Some(creating) = &mut creating {
-        creating.synced = true;
-    }
+    creating.synced = true;
     Ok(())
+}
+
+/// Creates `dir` and its missing ancestors one at a time, as [`std::fs::create_dir_all`] does,
+/// registering each in `creating` before creating it. Appends the directories it created to
+/// `created`, highest first; one another caller created in the meantime is not appended.
+fn create_dir_all_recording(
+    dir: &std::path::Path,
+    creating: &mut CreatingDirs,
+    created: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    creating.add(dir);
+    match create_dir(dir) {
+        Ok(()) => {
+            created.push(dir.to_path_buf());
+            return Ok(());
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(_) if dir.is_dir() => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    match dir.parent() {
+        Some(p) => create_dir_all_recording(p, creating, created)?,
+        None => return Err(io::Error::other("failed to create whole tree")),
+    }
+    match create_dir(dir) {
+        Ok(()) => {
+            created.push(dir.to_path_buf());
+            Ok(())
+        }
+        Err(_) if dir.is_dir() => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`std::fs::create_dir`], preceded by the test hook.
+fn create_dir(dir: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(hook) = tests::BEFORE_CREATE_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        hook(dir);
+    }
+    std::fs::create_dir(dir)
 }
 
 /// Renames `from` to `to`, then — when `fsync` is enabled — fsyncs the destination's parent
@@ -1045,8 +1090,8 @@ fn lock_dirs() -> std::sync::MutexGuard<'static, DirRegistry> {
     DIRS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Registration in [`DIRS`], removed on drop. Unless `synced` is set, the directories are then
-/// recorded as unsynced.
+/// Registration in [`DIRS`], removed on drop. Unless `synced` is set, the directories that exist
+/// by then are recorded as unsynced.
 struct CreatingDirs {
     dirs: Vec<PathBuf>,
     synced: bool,
@@ -1063,10 +1108,33 @@ impl CreatingDirs {
             synced: false,
         }
     }
+
+    /// Registers `dir` too, unless it already is.
+    fn add(&mut self, dir: &std::path::Path) {
+        if self.dirs.iter().any(|d| d == dir) {
+            return;
+        }
+        *lock_dirs().creating.entry(dir.to_path_buf()).or_default() += 1;
+        self.dirs.push(dir.to_path_buf());
+    }
 }
 
 impl Drop for CreatingDirs {
     fn drop(&mut self) {
+        // A path that is not a directory has no entries to sync; recording it would keep it in the
+        // process-global set for good. One whose state cannot be determined might be one.
+        let unsynced: Vec<_> = if self.synced {
+            Vec::new()
+        } else {
+            self.dirs
+                .iter()
+                .filter(|dir| match std::fs::metadata(dir) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(e) => e.kind() != ErrorKind::NotFound,
+                })
+                .cloned()
+                .collect()
+        };
         let mut registry = lock_dirs();
         for dir in &self.dirs {
             if let Some(count) = registry.creating.get_mut(dir) {
@@ -1075,10 +1143,8 @@ impl Drop for CreatingDirs {
                     registry.creating.remove(dir);
                 }
             }
-            if !self.synced {
-                registry.unsynced.insert(dir.clone());
-            }
         }
+        registry.unsynced.extend(unsynced);
         DIRS_CREATED.notify_all();
     }
 }
@@ -1631,6 +1697,157 @@ mod tests {
     /// Every directory [`fsync_dir`] synced, across all tests.
     pub(super) static SYNCED_DIRS: std::sync::Mutex<Vec<PathBuf>> =
         std::sync::Mutex::new(Vec::new());
+
+    /// Runs before every [`create_dir`], with the directory about to be created.
+    #[allow(clippy::type_complexity)]
+    pub(super) static BEFORE_CREATE_DIR: std::sync::Mutex<
+        Option<Box<dyn FnMut(&std::path::Path) + Send>>,
+    > = std::sync::Mutex::new(None);
+
+    /// Runs `op` with `hook` installed as [`BEFORE_CREATE_DIR`]. One `op` at a time.
+    async fn with_create_dir_hook<T>(
+        hook: impl FnMut(&std::path::Path) + Send + 'static,
+        op: impl std::future::Future<Output = T> + Send,
+    ) -> T {
+        static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _serial = ONE_AT_A_TIME.lock().await;
+        *BEFORE_CREATE_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+        let result = op.await;
+        *BEFORE_CREATE_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        result
+    }
+
+    fn synced_under(root: &std::path::Path) -> Vec<PathBuf> {
+        SYNCED_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|dir| dir.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
+    fn unsynced_under(root: &std::path::Path) -> Vec<PathBuf> {
+        lock_dirs()
+            .unsynced
+            .iter()
+            .filter(|dir| dir.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
+    /// A concurrent delete with automatic cleanup removes an ancestor the creation found
+    /// existing; the creation recreates it and must sync the directory holding its entry.
+    #[tokio::test]
+    async fn fsync_creation_syncs_an_ancestor_removed_by_concurrent_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(tmp.path())
+            .unwrap()
+            .with_fsync(true)
+            .with_automatic_cleanup(true);
+        let file = integration
+            .path_to_filesystem(&Path::from("a/b/file"))
+            .unwrap();
+        let b = file.parent().unwrap().to_path_buf();
+        let a = b.parent().unwrap().to_path_buf();
+        let root = a.parent().unwrap().to_path_buf();
+
+        integration
+            .put(&Path::from("a/other"), Bytes::from("1").into())
+            .await
+            .unwrap();
+        let before = synced_under(&root).len();
+
+        // Before the first `create_dir`, the delete of `a/other` with automatic cleanup removes
+        // `a`, which the creation found existing.
+        let (removed, creating_b) = (a.clone(), b.clone());
+        let mut done = false;
+        with_create_dir_hook(
+            move |dir| {
+                if dir == creating_b && !done {
+                    done = true;
+                    fs::remove_file(removed.join("other")).unwrap();
+                    fs::remove_dir(&removed).unwrap();
+                }
+            },
+            integration.put(&Path::from("a/b/file"), Bytes::from("2").into()),
+        )
+        .await
+        .unwrap();
+
+        assert!(file.exists());
+        let synced = &synced_under(&root)[before..];
+        for dir in [&b, &a, &root] {
+            assert!(synced.contains(dir), "{dir:?} not synced: {synced:?}");
+        }
+    }
+
+    /// Another creation makes `y` between this one's creation of `x` and of `x/y/z`; `y` holds
+    /// the entry of `z`, so this creation must sync it too.
+    #[tokio::test]
+    async fn fsync_creation_syncs_a_directory_another_creation_made_in_between() {
+        let tmp = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(tmp.path())
+            .unwrap()
+            .with_fsync(true);
+        let file = integration
+            .path_to_filesystem(&Path::from("x/y/z/file"))
+            .unwrap();
+        let z = file.parent().unwrap().to_path_buf();
+        let y = z.parent().unwrap().to_path_buf();
+        let x = y.parent().unwrap().to_path_buf();
+        let root = x.parent().unwrap().to_path_buf();
+        let before = synced_under(&root).len();
+
+        // The second attempt at `y` comes right after `x` was created.
+        let (made_x, making_y) = (x.clone(), y.clone());
+        let mut done = false;
+        with_create_dir_hook(
+            move |dir| {
+                if dir == making_y && made_x.exists() && !done {
+                    done = true;
+                    fs::create_dir(&making_y).unwrap();
+                }
+            },
+            integration.put(&Path::from("x/y/z/file"), Bytes::from("1").into()),
+        )
+        .await
+        .unwrap();
+
+        let synced = &synced_under(&root)[before..];
+        for dir in [&z, &y, &x, &root] {
+            assert!(synced.contains(dir), "{dir:?} not synced: {synced:?}");
+        }
+    }
+
+    /// A creation that fails before creating anything leaves nothing for later writes.
+    #[tokio::test]
+    #[cfg(target_family = "unix")]
+    async fn fsync_failed_creation_records_only_directories_that_exist() {
+        let tmp = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(tmp.path())
+            .unwrap()
+            .with_fsync(true);
+        let unwritable = integration.path_to_filesystem(&Path::from("ro")).unwrap();
+        let root = unwritable.parent().unwrap().to_path_buf();
+        assert!(unsynced_under(&root).is_empty());
+
+        // `mkdir` under an unwritable directory fails with EACCES, having created nothing.
+        fs::create_dir(&unwritable).unwrap();
+        fs::set_permissions(&unwritable, fs::Permissions::from_mode(0o555)).unwrap();
+        for i in 0..50 {
+            let err = integration
+                .put(
+                    &Path::from(format!("ro/k{i}/file")),
+                    Bytes::from("x").into(),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Unable to create dir"), "{err}");
+        }
+        fs::set_permissions(&unwritable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(unsynced_under(&root), Vec::<PathBuf>::new());
+    }
 
     #[tokio::test]
     #[cfg(target_family = "unix")]
