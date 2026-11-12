@@ -62,7 +62,7 @@ serde_urlencoded = { version = "0.7", optional = true }
 tokio = { version = "1.29.0", features = ["sync", "macros", "rt", "time", "io-util"] }
 
 [target.'cfg(target_family="unix")'.dependencies]
-nix = { version = "0.30.0", default-features = false, optional = true }
+nix = { version = "0.30.0", default-features = false, features = ["fs", "resource"], optional = true }
 
 [target.'cfg(target_family="windows")'.dependencies]
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Foundation"], optional = true }
