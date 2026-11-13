@@ -356,7 +356,8 @@ impl DirCache {
     /// The root handle, opened on first use. A root removed behind the cache is reported stale
     /// by the operation that notices and recreated here on the retry, as the path-based code
     /// does. Whoever opens an uncached root fsyncs the directory holding its entry: another
-    /// thread may have just created it and not synced it yet.
+    /// thread may have just created it and not synced it yet. A parent this store may not open
+    /// (traverse-only permissions) is left alone unless this call created the root.
     fn root_handle(&self) -> Result<Arc<DirHandle>, DirError> {
         let key = PathBuf::new();
         if let Some(root) = self.inner.lock().dirs.get(&key) {
@@ -366,6 +367,7 @@ impl DirCache {
             dir: self.root.clone(),
             source: e.into(),
         };
+        let mut created = false;
         let fd = match open(&self.root, DIR_FLAGS, Mode::empty()) {
             Err(Errno::ENOENT) => {
                 // Creates and fsyncs every missing ancestor and the first existing one.
@@ -374,15 +376,19 @@ impl DirCache {
                         dir: self.root.clone(),
                         source: io::Error::other(e),
                     })?;
+                created = true;
                 open(&self.root, DIR_FLAGS, Mode::empty()).map_err(open_error)?
             }
             other => other.map_err(open_error)?,
         };
         if let Some(parent) = self.root.parent() {
-            super::fsync_dir(parent).map_err(|source| DirError::Sync {
-                dir: parent.to_path_buf(),
-                source,
-            })?;
+            match super::fsync_dir(parent) {
+                Err(e) if !created && e.kind() == io::ErrorKind::PermissionDenied => {}
+                other => other.map_err(|source| DirError::Sync {
+                    dir: parent.to_path_buf(),
+                    source,
+                })?,
+            }
         }
         let handle =
             DirHandle::new(key.clone(), self.root.clone(), fd, None).map_err(open_error)?;
