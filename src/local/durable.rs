@@ -482,19 +482,43 @@ pub(super) fn delete(
     })
 }
 
-/// A multipart upload's staging file, published by [`Upload::complete`].
+/// A multipart upload's staging file, published by [`Upload::complete`]. One dropped before it
+/// completed or was discarded (its future cancelled) is cleaned up like [`Upload::discard`], best
+/// effort.
 pub(super) struct Upload {
     chain: Vec<Arc<DirHandle>>,
-    staging: Staging,
+    /// Taken by `complete` and `discard`.
+    staging: Option<Staging>,
     name: OsString,
 }
 
 impl std::fmt::Debug for Upload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upload")
-            .field("staging", &self.staging.path())
+            .field("staging", &self.staging.as_ref().map(Staging::path))
             .finish_non_exhaustive()
     }
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            let _ = remove_staging(staging);
+            let _ = dir_cache::sync_chain(&self.chain);
+        }
+    }
+}
+
+/// Removes the staging file `staging` itself, unrecorded.
+fn remove_staging(mut staging: Staging) -> Result<()> {
+    staging.keep = true;
+    dir_cache::unlink_unsynced(&staging.dir, &staging.name).map_err(|e| {
+        Error::UnableToDeleteFile {
+            source: e.into(),
+            path: staging.path(),
+        }
+        .into()
+    })
 }
 
 /// Creates the staging file for a multipart upload to `dest`. Its directory stays dirty until the
@@ -514,7 +538,7 @@ pub(super) fn stage(
                 file,
                 Upload {
                     chain,
-                    staging,
+                    staging: Some(staging),
                     name: name.to_os_string(),
                 },
             )),
@@ -525,36 +549,22 @@ pub(super) fn stage(
 
 impl Upload {
     /// Syncs and closes `file`, renames it into place and fsyncs the chain.
-    pub(super) fn complete(self, file: File) -> Result<Metadata> {
-        let Self {
-            chain,
-            staging,
-            name,
-        } = self;
+    pub(super) fn complete(mut self, file: File) -> Result<Metadata> {
+        let staging = self.staging.take().expect("published or discarded once");
         let staging_path = staging.path();
         let published = staged_metadata(&file, &staging_path).and_then(|metadata| {
             sync_and_close(file, &staging_path, true)?;
             staging
-                .publish(&PutMode::Overwrite, &name)
+                .publish(&PutMode::Overwrite, &self.name)
                 .map_err(|e| Error::UnableToRenameFile { source: e.into() })?;
             Ok(metadata)
         });
-        synced(&chain, published)
+        synced(&self.chain, published)
     }
 
     /// Removes the staging file and fsyncs the chain, leaving the handles clean.
-    pub(super) fn discard(self) -> Result<()> {
-        let Self {
-            chain, mut staging, ..
-        } = self;
-        staging.keep = true;
-        let removed = dir_cache::unlink_unsynced(&staging.dir, &staging.name).map_err(|e| {
-            Error::UnableToDeleteFile {
-                source: e.into(),
-                path: staging.path(),
-            }
-            .into()
-        });
-        synced(&chain, removed)
+    pub(super) fn discard(mut self) -> Result<()> {
+        let staging = self.staging.take().expect("published or discarded once");
+        synced(&self.chain, remove_staging(staging))
     }
 }

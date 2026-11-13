@@ -2134,6 +2134,44 @@ mod tests {
             panic!("the dropped upload's staging file was not removed");
         }
 
+        /// Multipart uploads whose futures are dropped before they return (cancelled) leave no
+        /// staging file and no dirty handle behind.
+        #[tokio::test]
+        async fn fsync_cancelled_multipart_starts_leave_handles_clean() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
+            let capacity = 16;
+            cache.set_capacity(capacity);
+            let dirs = 32;
+
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            for i in 0..dirs {
+                let location = Path::from(format!("d{i}/f"));
+                // One poll starts the staging on the blocking pool; the future is then dropped.
+                let mut started = Box::pin(store.put_multipart(&location));
+                let _ = std::future::Future::poll(started.as_mut(), &mut cx);
+            }
+
+            // The blocking tasks finish on their own and tokio drops their results.
+            let staged =
+                |i: usize| fs::read_dir(tmp.path().join(format!("d{i}"))).map(|d| d.count());
+            for _ in 0..400 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if (0..dirs).all(|i| staged(i).is_ok_and(|n| n == 0)) && cache.dirty_count() == 0 {
+                    break;
+                }
+            }
+            for i in 0..dirs {
+                assert_eq!(staged(i).unwrap(), 0, "d{i} keeps a staging file");
+            }
+            assert_eq!(cache.dirty_count(), 0);
+
+            // Clean, the handles beyond the capacity are evicted by the next insert.
+            store.put(&Path::from("e/f"), "1".into()).await.unwrap();
+            assert!(cache.len() <= capacity, "{} handles cached", cache.len());
+        }
+
         /// A delete through a handle whose directory was replaced retries from the root; a
         /// missing entry in a live directory is reported without evicting the handle.
         #[tokio::test]
