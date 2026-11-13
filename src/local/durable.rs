@@ -74,23 +74,27 @@ impl From<DirError> for crate::Error {
     }
 }
 
-/// Retries an operation makes at most: more than the directories on any chain, so a cascade of
-/// removed ancestors is followed to the root, and an end if a directory looks removed on every
-/// attempt.
+/// Retries an operation makes at most, beyond one per directory on its chain (a cascade of
+/// removed ancestors evicts one per retry), so an operation ends if a directory looks removed on
+/// every attempt.
 const MAX_RETRIES: usize = 16;
 
-/// Runs `op`, retrying it from the root each time it finds a cached directory removed. A handle
-/// is evicted at most once per operation; a fresh one found removed is another removal.
-fn retrying<T>(cache: &DirCache, mut op: impl FnMut() -> Result<T, Attempt>) -> Result<T> {
+/// Runs `op`, an operation on chains `depth` directories long at most, retrying it from the root
+/// each time it finds a cached directory removed. A handle is evicted at most once per operation;
+/// a fresh one found removed is another removal.
+fn retrying<T>(
+    cache: &DirCache,
+    depth: &std::path::Path,
+    mut op: impl FnMut() -> Result<T, Attempt>,
+) -> Result<T> {
+    let limit = depth.components().count() + MAX_RETRIES;
     let mut evicted: Vec<Arc<DirHandle>> = Vec::new();
     loop {
         match op() {
             Ok(value) => return Ok(value),
             Err(Attempt::Failed(e)) => return Err(e),
             Err(Attempt::Stale(dir)) => {
-                if evicted.len() >= MAX_RETRIES
-                    || evicted.iter().any(|seen| Arc::ptr_eq(seen, &dir))
-                {
+                if evicted.len() >= limit || evicted.iter().any(|seen| Arc::ptr_eq(seen, &dir)) {
                     return Err(DirError::Stale { dir }.into());
                 }
                 cache.evict(&dir);
@@ -286,7 +290,7 @@ pub(super) fn put(
 ) -> Result<PutResult> {
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, path)?;
-    let metadata = retrying(cache, || {
+    let metadata = retrying(cache, rel_parent, || {
         let chain = cache.resolve(rel_parent, true)?;
         let parent = last(&chain);
         let published = stage_file(cache, parent, name, path).and_then(|(mut file, staging)| {
@@ -318,7 +322,7 @@ pub(super) fn copy(
 ) -> Result<()> {
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, to)?;
-    retrying(cache, || {
+    retrying(cache, rel_parent, || {
         let chain = resolve_destination(cache, rel_parent, from)?;
         let parent = last(&chain);
         let linked = match mode {
@@ -355,7 +359,8 @@ pub(super) fn rename(config: &Config, from: &std::path::Path, to: &std::path::Pa
     let cache = &config.dirs;
     let (from_rel, from_name) = split(cache, from)?;
     let (to_rel, to_name) = split(cache, to)?;
-    retrying(cache, || {
+    let deeper = std::cmp::max_by_key(from_rel, to_rel, |rel| rel.components().count());
+    retrying(cache, deeper, || {
         let from_chain = resolve_existing(cache, from_rel, from)?;
         let to_chain = resolve_destination(cache, to_rel, from)?;
         let (from_dir, to_dir) = (last(&from_chain), last(&to_chain));
@@ -397,7 +402,7 @@ pub(super) fn delete(
 ) -> Result<()> {
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, path)?;
-    retrying(cache, || {
+    retrying(cache, rel_parent, || {
         let chain = resolve_existing(cache, rel_parent, path)?;
         let parent = last(&chain);
         let unlink = if sync {
@@ -455,7 +460,7 @@ impl std::fmt::Debug for Upload {
 pub(super) fn stage(config: &Config, dest: &std::path::Path) -> Result<(File, Upload)> {
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, dest)?;
-    retrying(cache, || {
+    retrying(cache, rel_parent, || {
         let chain = cache.resolve(rel_parent, true)?;
         let parent = last(&chain);
         match stage_file(cache, parent, name, dest) {
