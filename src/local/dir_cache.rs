@@ -400,14 +400,29 @@ impl DirCache {
 
     /// Forgets the handle at `rel` if its path no longer names its directory, after the
     /// directory was moved away. Handles under it are replaced as they are found under another
-    /// parent.
-    pub(super) fn evict_moved(&self, rel: &Path) {
+    /// parent, so the changes they still owe an fsync are fsynced first: whoever writes into the
+    /// moved directory next opens new handles and does not see them. A change still in flight
+    /// during the move stays uncovered.
+    pub(super) fn evict_moved(&self, rel: &Path) -> Result<(), DirError> {
         let cached = self.inner.lock().dirs.get(rel).cloned();
-        if let Some(handle) = cached {
-            if !handle.is_current() {
-                self.evict(&handle);
-            }
+        let Some(handle) = cached else {
+            return Ok(());
+        };
+        if handle.is_current() {
+            return Ok(());
         }
+        let dirty: Vec<Arc<DirHandle>> = {
+            let inner = self.inner.lock();
+            inner
+                .dirs
+                .values()
+                .filter(|moved| moved.rel.starts_with(rel) && moved.is_dirty())
+                .cloned()
+                .collect()
+        };
+        let synced = sync_chain(&dirty);
+        self.evict(&handle);
+        synced
     }
 
     /// The root handle, opened on first use. A root removed behind the cache is reported stale

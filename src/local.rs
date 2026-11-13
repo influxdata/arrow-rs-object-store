@@ -2219,6 +2219,42 @@ mod tests {
             assert!(!Arc::ptr_eq(&b1, &cached(&store, "a/b")));
         }
 
+        /// Renaming a directory fsyncs the changes its handles still owe before they are
+        /// evicted: a later write into the moved directory opens new handles that know nothing
+        /// of them.
+        #[tokio::test]
+        async fn fsync_rename_of_a_directory_syncs_its_dirty_handles() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let mut upload = store
+                .put_multipart(&Path::from("a/b/pending"))
+                .await
+                .unwrap();
+            upload.put_part("data".into()).await.unwrap();
+            let (old_a, old_b) = (cached(&store, "a"), cached(&store, "a/b"));
+            assert!(old_a.is_dirty() && old_b.is_dirty());
+
+            store
+                .rename(&Path::from("a"), &Path::from("c"))
+                .await
+                .unwrap();
+            assert!(!old_a.is_dirty() && !old_b.is_dirty());
+            assert_eq!(fsyncs(&old_b), 1);
+            assert!(store
+                .config
+                .dirs
+                .cached(std::path::Path::new("a"))
+                .is_none());
+
+            store
+                .put(&Path::from("c/b/file"), "1".into())
+                .await
+                .unwrap();
+            assert_eq!(read(&store, "c/b/file").await, Bytes::from("1"));
+            upload.complete().await.unwrap();
+            assert_eq!(read(&store, "c/b/pending").await, Bytes::from("data"));
+        }
+
         /// The handle of a renamed directory is evicted even when the fsync after the rename
         /// fails: the rename itself happened.
         #[tokio::test]
