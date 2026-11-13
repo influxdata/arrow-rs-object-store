@@ -2251,21 +2251,21 @@ mod tests {
             assert!(clock <= 2 * 3 + 1, "{clock} clock entries after 200 cycles");
         }
 
-        /// Renaming a directory moves its cached handles out from under their keys; the next
-        /// write at the old path makes a new directory.
+        /// Renaming a directory moves its cached handle out from under its key, and the handles
+        /// under it are replaced when next looked up; the next write at the old path makes a
+        /// new directory.
         #[tokio::test]
         async fn fsync_rename_of_a_directory_evicts_its_handles() {
             let tmp = TempDir::new().unwrap();
             let store = fsync_store(&tmp);
             let cache = &store.config.dirs;
             store.put(&Path::from("a/b/x"), "1".into()).await.unwrap();
-            let a1 = cached(&store, "a");
+            let (a1, b1) = (cached(&store, "a"), cached(&store, "a/b"));
             store
                 .rename(&Path::from("a"), &Path::from("c"))
                 .await
                 .unwrap();
             assert!(cache.cached(std::path::Path::new("a")).is_none());
-            assert!(cache.cached(std::path::Path::new("a/b")).is_none());
             assert_eq!(read(&store, "c/b/x").await, Bytes::from("1"));
 
             store.put(&Path::from("a/b/y"), "2".into()).await.unwrap();
@@ -2275,6 +2275,53 @@ mod tests {
                 crate::Error::NotFound { .. }
             ));
             assert!(!Arc::ptr_eq(&a1, &cached(&store, "a")));
+            assert!(!Arc::ptr_eq(&b1, &cached(&store, "a/b")));
+        }
+
+        /// The handle of a renamed directory is evicted even when the fsync after the rename
+        /// fails: the rename itself happened.
+        #[tokio::test]
+        async fn fsync_rename_of_a_directory_evicts_its_handles_when_the_fsync_fails() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
+            store.put(&Path::from("a/b/x"), "1".into()).await.unwrap();
+            let root = cached(&store, "");
+
+            fail_syncs(&root, true);
+            let err = store
+                .rename(&Path::from("a"), &Path::from("c"))
+                .await
+                .unwrap_err();
+            fail_syncs(&root, false);
+            assert!(matches!(local_error(err), Error::UnableToSyncFile { .. }));
+            assert!(cache.cached(std::path::Path::new("a")).is_none());
+            assert_eq!(read(&store, "c/b/x").await, Bytes::from("1"));
+
+            store.put(&Path::from("a/y"), "2".into()).await.unwrap();
+            assert_eq!(read(&store, "a/y").await, Bytes::from("2"));
+            assert!(matches!(
+                store.get(&Path::from("c/y")).await.unwrap_err(),
+                crate::Error::NotFound { .. }
+            ));
+        }
+
+        /// A directory that looks removed on every attempt (a filesystem reporting no links)
+        /// does not keep a missing object's operation retrying.
+        #[tokio::test]
+        async fn fsync_forced_stale_handles_do_not_retry_forever() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
+            store.put(&Path::from("a/f"), "1".into()).await.unwrap();
+
+            cache.force_stale(true);
+            let err = store.delete(&Path::from("a/missing")).await.unwrap_err();
+            cache.force_stale(false);
+            assert!(matches!(err, crate::Error::NotFound { .. }), "{err}");
+
+            store.delete(&Path::from("a/f")).await.unwrap();
+            assert_eq!(fs::read_dir(tmp.path().join("a")).unwrap().count(), 0);
         }
 
         /// A root removed behind the cache is recreated by the next write, as the path-based
@@ -2789,14 +2836,15 @@ mod tests {
                 .with_fsync(fsync);
             let payload = PutPayload::from("arbitrary data");
 
-            // Overwrite: the rename fails on a non-empty directory.
+            // Overwrite: the rename fails on a non-empty directory; that is not "already exists".
             let location = Path::from("dir");
             let dest = integration.path_to_filesystem(&location).unwrap();
             fs::create_dir_all(dest.join("child")).unwrap();
-            integration
+            let err = integration
                 .put(&location, payload.clone())
                 .await
                 .unwrap_err();
+            assert!(!matches!(err, crate::Error::AlreadyExists { .. }), "{err}");
             assert_eq!(
                 fs::read_dir(root.path()).unwrap().count(),
                 1,

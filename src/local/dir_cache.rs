@@ -69,6 +69,9 @@ pub(super) enum DirError {
 pub(super) struct DirCache {
     root: PathBuf,
     inner: Mutex<Inner>,
+    /// Makes every `ENOENT` look like a removed directory.
+    #[cfg(test)]
+    force_stale: AtomicBool,
 }
 
 struct Inner {
@@ -194,17 +197,10 @@ impl DirHandle {
         Ok(())
     }
 
-    /// `ENOENT` from an entry operation through this handle means the directory is gone (every
-    /// entry operation in a removed directory reports it) or the entry is.
-    pub(super) fn stale(self: &Arc<Self>, e: Errno) -> Option<DirError> {
-        (e == Errno::ENOENT && self.is_removed()).then(|| DirError::Stale {
-            dir: Arc::clone(self),
-        })
-    }
-
     /// A removed directory keeps its inode while this descriptor is open, with no links left.
+    /// Only a successful `fstat` counts: some filesystems do not report links.
     fn is_removed(&self) -> bool {
-        fstat(&self.fd).map(|s| s.st_nlink == 0).unwrap_or(true)
+        fstat(&self.fd).is_ok_and(|s| s.st_nlink == 0)
     }
 
     /// Whether `path` still names this directory. A directory moved elsewhere is not removed,
@@ -244,7 +240,32 @@ impl DirCache {
                 dirs: HashMap::new(),
                 clock: VecDeque::new(),
             }),
+            #[cfg(test)]
+            force_stale: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_stale(&self, on: bool) {
+        self.force_stale.store(on, Ordering::Relaxed);
+    }
+
+    /// `ENOENT` from an entry operation through `dir` means the directory is gone (every entry
+    /// operation in a removed directory reports it) or the entry is. Only a directory with no
+    /// links left whose path no longer names it counts as gone; anything else is the entry.
+    pub(super) fn stale(&self, dir: &Arc<DirHandle>, e: Errno) -> Option<DirError> {
+        if e != Errno::ENOENT {
+            return None;
+        }
+        #[cfg(test)]
+        if self.force_stale.load(Ordering::Relaxed) {
+            return Some(DirError::Stale {
+                dir: Arc::clone(dir),
+            });
+        }
+        (dir.is_removed() && !dir.is_current()).then(|| DirError::Stale {
+            dir: Arc::clone(dir),
+        })
     }
 
     #[cfg(test)]
@@ -320,19 +341,12 @@ impl DirCache {
         drop(removed);
     }
 
-    /// Forgets the handles at and under `rel` whose path no longer names their directory, after
-    /// the directory at `rel` was moved away.
+    /// Forgets the handle at `rel` if its path no longer names its directory, after the
+    /// directory was moved away. Handles under it are replaced as they are found under another
+    /// parent.
     pub(super) fn evict_moved(&self, rel: &Path) {
-        let moved: Vec<Arc<DirHandle>> = {
-            let inner = self.inner.lock();
-            inner
-                .dirs
-                .values()
-                .filter(|handle| handle.rel.starts_with(rel))
-                .cloned()
-                .collect()
-        };
-        for handle in moved {
+        let cached = self.inner.lock().dirs.get(rel).cloned();
+        if let Some(handle) = cached {
             if !handle.is_current() {
                 self.evict(&handle);
             }
@@ -341,7 +355,8 @@ impl DirCache {
 
     /// The root handle, opened on first use. A root removed behind the cache is reported stale
     /// by the operation that notices and recreated here on the retry, as the path-based code
-    /// does, with its entry fsynced.
+    /// does. Whoever opens an uncached root fsyncs the directory holding its entry: another
+    /// thread may have just created it and not synced it yet.
     fn root_handle(&self) -> Result<Arc<DirHandle>, DirError> {
         let key = PathBuf::new();
         if let Some(root) = self.inner.lock().dirs.get(&key) {
@@ -353,26 +368,36 @@ impl DirCache {
         };
         let fd = match open(&self.root, DIR_FLAGS, Mode::empty()) {
             Err(Errno::ENOENT) => {
-                std::fs::create_dir_all(&self.root).map_err(|source| DirError::Create {
-                    dir: self.root.clone(),
-                    source,
-                })?;
-                if let Some(parent) = self.root.parent() {
-                    super::fsync_dir(parent).map_err(|source| DirError::Sync {
-                        dir: parent.to_path_buf(),
-                        source,
+                // Creates and fsyncs every missing ancestor and the first existing one.
+                super::create_parent_dirs(&self.root.join("#"), Errno::ENOENT.into(), true)
+                    .map_err(|e| DirError::Create {
+                        dir: self.root.clone(),
+                        source: io::Error::other(e),
                     })?;
-                }
                 open(&self.root, DIR_FLAGS, Mode::empty()).map_err(open_error)?
             }
             other => other.map_err(open_error)?,
         };
+        if let Some(parent) = self.root.parent() {
+            super::fsync_dir(parent).map_err(|source| DirError::Sync {
+                dir: parent.to_path_buf(),
+                source,
+            })?;
+        }
         let handle =
             DirHandle::new(key.clone(), self.root.clone(), fd, None).map_err(open_error)?;
+        let handle = Arc::new(handle);
         let mut inner = self.inner.lock();
-        Ok(Arc::clone(
-            inner.dirs.entry(key).or_insert_with(|| Arc::new(handle)),
-        ))
+        if let Some(existing) = inner.dirs.get(&key) {
+            let existing = Arc::clone(existing);
+            drop(inner);
+            // Closes the losing descriptor, outside the lock.
+            drop(handle);
+            return Ok(existing);
+        }
+        inner.dirs.insert(key, Arc::clone(&handle));
+        drop(inner);
+        Ok(handle)
     }
 
     /// The handle for `key`, the entry `name` of `parent`. A cached handle opened under another
@@ -392,7 +417,7 @@ impl DirCache {
         }
         let path = parent.path.join(name);
         let open_error = |e: Errno| {
-            parent.stale(e).unwrap_or_else(|| DirError::Open {
+            self.stale(parent, e).unwrap_or_else(|| DirError::Open {
                 dir: path.clone(),
                 source: e.into(),
             })
@@ -413,7 +438,7 @@ impl DirCache {
                     },
                 )
                 .map_err(|e| {
-                    parent.stale(e).unwrap_or_else(|| DirError::Create {
+                    self.stale(parent, e).unwrap_or_else(|| DirError::Create {
                         dir: path.clone(),
                         source: e.into(),
                     })
@@ -428,15 +453,30 @@ impl DirCache {
         let handle = DirHandle::new(key.to_path_buf(), path.clone(), fd, Some(parent.inode))
             .map_err(open_error)?;
         let handle = Arc::new(handle);
-        let evicted = {
-            let mut inner = self.inner.lock();
-            if let Some(existing) = inner.dirs.get(key) {
-                if existing.parent == Some(parent.inode) {
-                    return Ok(Arc::clone(existing));
-                }
+        let mut inner = self.inner.lock();
+        let existing = inner.dirs.get(key).cloned();
+        if let Some(existing) = existing {
+            if existing.parent == Some(parent.inode) {
+                return Ok(existing);
             }
-            inner.insert(key.to_path_buf(), Arc::clone(&handle))
-        };
+            // The cached handle was opened under another directory of this name. If that one
+            // still exists, `parent` is the one that was moved away, and the cached handle is the
+            // right one for this path; this one serves the chain without being cached.
+            drop(inner);
+            if !existing.is_removed() && existing.is_current() {
+                return Ok(handle);
+            }
+            inner = self.inner.lock();
+            if !inner
+                .dirs
+                .get(key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &existing))
+            {
+                return Ok(handle);
+            }
+        }
+        let evicted = inner.insert(key.to_path_buf(), Arc::clone(&handle));
+        drop(inner);
         // Closes the descriptors, outside the lock.
         drop(evicted);
         Ok(handle)

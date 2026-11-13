@@ -74,6 +74,11 @@ impl From<DirError> for crate::Error {
     }
 }
 
+/// Retries an operation makes at most: more than the directories on any chain, so a cascade of
+/// removed ancestors is followed to the root, and an end if a directory looks removed on every
+/// attempt.
+const MAX_RETRIES: usize = 16;
+
 /// Runs `op`, retrying it from the root each time it finds a cached directory removed. A handle
 /// is evicted at most once per operation; a fresh one found removed is another removal.
 fn retrying<T>(cache: &DirCache, mut op: impl FnMut() -> Result<T, Attempt>) -> Result<T> {
@@ -83,7 +88,9 @@ fn retrying<T>(cache: &DirCache, mut op: impl FnMut() -> Result<T, Attempt>) -> 
             Ok(value) => return Ok(value),
             Err(Attempt::Failed(e)) => return Err(e),
             Err(Attempt::Stale(dir)) => {
-                if evicted.iter().any(|seen| Arc::ptr_eq(seen, &dir)) {
+                if evicted.len() >= MAX_RETRIES
+                    || evicted.iter().any(|seen| Arc::ptr_eq(seen, &dir))
+                {
                     return Err(DirError::Stale { dir }.into());
                 }
                 cache.evict(&dir);
@@ -94,8 +101,14 @@ fn retrying<T>(cache: &DirCache, mut op: impl FnMut() -> Result<T, Attempt>) -> 
 }
 
 /// `e` from an entry operation through `dir`: a stale `dir` to retry, or `other`.
-fn entry_error(dir: &Arc<DirHandle>, e: Errno, other: impl FnOnce(io::Error) -> Error) -> Attempt {
-    dir.stale(e)
+fn entry_error(
+    cache: &DirCache,
+    dir: &Arc<DirHandle>,
+    e: Errno,
+    other: impl FnOnce(io::Error) -> Error,
+) -> Attempt {
+    cache
+        .stale(dir, e)
         .map(Attempt::from)
         .unwrap_or_else(|| other(e.into()).into())
 }
@@ -223,19 +236,20 @@ impl Drop for Staging {
 
 /// Creates a staging file for `path` in `parent`, the directory of `path`.
 fn stage_file(
+    cache: &DirCache,
     parent: &Arc<DirHandle>,
     name: &OsStr,
     path: &std::path::Path,
 ) -> Result<(File, Staging), Attempt> {
     Staging::new(parent, name, |s| dir_cache::create_new(parent, s)).map_err(|e| {
-        entry_error(parent, e, |source| Error::UnableToOpenFile {
+        entry_error(cache, parent, e, |source| Error::UnableToOpenFile {
             source,
             path: path.to_path_buf(),
         })
     })
 }
 
-/// `e` from publishing `path` exclusively: `AlreadyExists` for `EEXIST`, else `other`.
+/// `e` from publishing `path` in create mode: `AlreadyExists` for `EEXIST`, else `other`.
 fn exists_or(e: Errno, path: &std::path::Path, other: impl FnOnce(io::Error) -> Error) -> Error {
     match e {
         Errno::EEXIST => Error::AlreadyExists {
@@ -275,7 +289,7 @@ pub(super) fn put(
     let metadata = retrying(cache, || {
         let chain = cache.resolve(rel_parent, true)?;
         let parent = last(&chain);
-        let published = stage_file(parent, name, path).and_then(|(mut file, staging)| {
+        let published = stage_file(cache, parent, name, path).and_then(|(mut file, staging)| {
             let staging_path = staging.path();
             payload
                 .iter()
@@ -283,9 +297,11 @@ pub(super) fn put(
                 .map_err(|source| Error::UnableToCopyDataToFile { source })?;
             let metadata = staged_metadata(&file, &staging_path)?;
             sync_and_close(file, &staging_path, true)?;
-            staging
-                .publish(mode, name)
-                .map_err(|e| exists_or(e, path, |source| Error::UnableToRenameFile { source }))?;
+            let rename_error = |source| Error::UnableToRenameFile { source };
+            staging.publish(mode, name).map_err(|e| match mode {
+                PutMode::Create => exists_or(e, path, rename_error),
+                _ => rename_error(e.into()),
+            })?;
             Ok(metadata)
         });
         synced(&chain, published)
@@ -313,16 +329,22 @@ pub(super) fn copy(
             }
         };
         let linked = linked.map_err(|e| match e {
-            Errno::ENOENT => entry_error(parent, e, |source| Error::NotFound {
+            Errno::ENOENT => entry_error(cache, parent, e, |source| Error::NotFound {
                 path: from.to_path_buf(),
                 source,
             }),
-            e => exists_or(e, to, |source| Error::UnableToCopyFile {
-                from: from.to_path_buf(),
-                to: to.to_path_buf(),
-                source,
-            })
-            .into(),
+            e => {
+                let copy_error = |source| Error::UnableToCopyFile {
+                    from: from.to_path_buf(),
+                    to: to.to_path_buf(),
+                    source,
+                };
+                match mode {
+                    CopyMode::Create => exists_or(e, to, copy_error),
+                    CopyMode::Overwrite => copy_error(e.into()),
+                }
+                .into()
+            }
         });
         synced(&chain, linked)
     })
@@ -339,9 +361,9 @@ pub(super) fn rename(config: &Config, from: &std::path::Path, to: &std::path::Pa
         let (from_dir, to_dir) = (last(&from_chain), last(&to_chain));
         let renamed =
             dir_cache::rename_between(from_dir, from_name, to_dir, to_name).map_err(|e| match e {
-                Errno::ENOENT => from_dir
-                    .stale(e)
-                    .or_else(|| to_dir.stale(e))
+                Errno::ENOENT => cache
+                    .stale(from_dir, e)
+                    .or_else(|| cache.stale(to_dir, e))
                     .map(Attempt::from)
                     .unwrap_or_else(|| {
                         Error::NotFound {
@@ -357,12 +379,11 @@ pub(super) fn rename(config: &Config, from: &std::path::Path, to: &std::path::Pa
                 }
                 .into(),
             });
-        let renamed = synced(&from_chain, synced(&to_chain, renamed));
-        // A renamed directory's handles still answer to its old path.
+        // A renamed directory's handle still answers to its old path, whatever the fsyncs do.
         if renamed.is_ok() {
             cache.evict_moved(&from_rel.join(from_name));
         }
-        renamed
+        synced(&from_chain, synced(&to_chain, renamed))
     })
 }
 
@@ -385,7 +406,7 @@ pub(super) fn delete(
             dir_cache::unlink_unsynced
         };
         unlink(parent, name).map_err(|e| match e {
-            Errno::ENOENT => entry_error(parent, e, |source| Error::NotFound {
+            Errno::ENOENT => entry_error(cache, parent, e, |source| Error::NotFound {
                 path: path.to_path_buf(),
                 source,
             }),
@@ -437,7 +458,7 @@ pub(super) fn stage(config: &Config, dest: &std::path::Path) -> Result<(File, Up
     retrying(cache, || {
         let chain = cache.resolve(rel_parent, true)?;
         let parent = last(&chain);
-        match stage_file(parent, name, dest) {
+        match stage_file(cache, parent, name, dest) {
             Ok((file, staging)) => Ok((
                 file,
                 Upload {
