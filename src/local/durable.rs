@@ -435,7 +435,14 @@ pub(super) fn delete(
             let below_removed = below
                 .ancestors()
                 .filter(|dir| !dir.as_os_str().is_empty())
-                .all(|dir| dir_cache::rmdir_in(parent, dir.as_os_str()).is_ok());
+                .all(|dir| {
+                    let removed = dir_cache::rmdir_in(parent, dir.as_os_str()).is_ok();
+                    if removed {
+                        // A handle below an evicted level may still be cached.
+                        cache.evict_removed(&parent.rel().join(dir));
+                    }
+                    removed
+                });
             if !below_removed {
                 return Ok(());
             }

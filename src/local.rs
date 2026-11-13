@@ -2018,15 +2018,26 @@ mod tests {
                 .unwrap();
 
             let store = fsync_store(&tmp).with_automatic_cleanup(true);
+            // `a/b/c` is cached while `a/b`, the level above it, is not.
+            store.put(&Path::from("a/b/c/g"), "1".into()).await.unwrap();
+            let c = cached(&store, "a/b/c");
+            store.config.dirs.evict(&cached(&store, "a/b"));
             store.delete(&Path::from("a/b/c/f")).await.unwrap();
-            assert_eq!(store.config.dirs.len(), 1, "only the root is cached");
+            store.delete(&Path::from("a/b/c/g")).await.unwrap();
+            assert_eq!(store.config.dirs.len(), 2, "the root and `a` stay cached");
+            assert!(store
+                .config
+                .dirs
+                .cached(std::path::Path::new("a/b/c"))
+                .is_none());
+            drop(c);
             assert!(!tmp.path().join("a/b").exists());
             assert!(tmp.path().join("a/keep").exists());
             assert!(matches!(
                 store.delete(&Path::from("a/b/c/f")).await.unwrap_err(),
                 crate::Error::NotFound { .. }
             ));
-            assert_eq!(store.config.dirs.len(), 1);
+            assert_eq!(store.config.dirs.len(), 2);
         }
 
         #[tokio::test]

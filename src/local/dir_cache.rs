@@ -378,6 +378,16 @@ impl DirCache {
         drop(removed);
     }
 
+    /// Forgets the handle at `rel` if its directory was removed.
+    pub(super) fn evict_removed(&self, rel: &Path) {
+        let cached = self.inner.lock().dirs.get(rel).cloned();
+        if let Some(handle) = cached {
+            if handle.is_removed() {
+                self.evict(&handle);
+            }
+        }
+    }
+
     /// Forgets the handle at `rel` if its path no longer names its directory, after the
     /// directory was moved away. Handles under it are replaced as they are found under another
     /// parent.
