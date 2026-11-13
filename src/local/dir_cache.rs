@@ -291,6 +291,16 @@ impl DirCache {
         self.inner.lock().clock.len()
     }
 
+    #[cfg(test)]
+    pub(super) fn dirty_count(&self) -> usize {
+        self.inner
+            .lock()
+            .dirs
+            .values()
+            .filter(|h| h.is_dirty())
+            .count()
+    }
+
     /// Splits an absolute path under the root into its parent directory (relative to the root)
     /// and its file name. `None` when the path is not under the root or has no file name.
     pub(super) fn split<'a>(&self, path: &'a Path) -> Option<(&'a Path, &'a OsStr)> {
