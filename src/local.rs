@@ -2324,6 +2324,39 @@ mod tests {
             assert_eq!(fs::read_dir(tmp.path().join("a")).unwrap().count(), 0);
         }
 
+        /// A store whose root sits under a directory it may traverse but not open writes
+        /// without fsyncing that directory; creating the root under it still has to.
+        #[tokio::test]
+        async fn fsync_root_under_an_unreadable_parent() {
+            // SAFETY: `geteuid` has no preconditions.
+            if unsafe { nix::libc::geteuid() } == 0 {
+                return; // permissions do not apply
+            }
+            let tmp = TempDir::new().unwrap();
+            let parent = tmp.path().join("p");
+            let root = parent.join("store");
+            fs::create_dir_all(&root).unwrap();
+            let original_permissions = fs::metadata(&parent).unwrap().permissions();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o311)).unwrap();
+            let store = LocalFileSystem::new_with_prefix(&root)
+                .unwrap()
+                .with_fsync(true);
+
+            let written = store.put(&Path::from("x"), "1".into()).await;
+            let read = store.get(&Path::from("x")).await;
+            fs::remove_dir_all(&root).unwrap();
+            let recreated = store.put(&Path::from("y"), "2".into()).await;
+            fs::set_permissions(&parent, original_permissions).unwrap();
+
+            written.unwrap();
+            assert_eq!(read.unwrap().bytes().await.unwrap(), Bytes::from("1"));
+            match local_error(recreated.unwrap_err()) {
+                Error::UnableToCreateDir { path, .. } => assert_eq!(path, root),
+                e => panic!("expected the root creation to fail, got {e}"),
+            }
+            store.put(&Path::from("y"), "2".into()).await.unwrap();
+        }
+
         /// A root removed behind the cache is recreated by the next write, as the path-based
         /// code does.
         #[tokio::test]
