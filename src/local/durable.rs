@@ -393,7 +393,9 @@ pub(super) fn rename(config: &Config, from: &std::path::Path, to: &std::path::Pa
 }
 
 /// Deletes `path`; with `sync` its directory is fsynced afterwards, with `automatic_cleanup` the
-/// directories left empty are removed (and leave the cache).
+/// directories left empty are removed (and leave the cache). Without `sync` no directory below
+/// the cached chain needs a handle: the object and the directories left empty are removed through
+/// the deepest cached ancestor.
 pub(super) fn delete(
     config: &Config,
     path: &std::path::Path,
@@ -403,14 +405,18 @@ pub(super) fn delete(
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, path)?;
     retrying(cache, rel_parent, || {
-        let chain = resolve_existing(cache, rel_parent, path)?;
+        let (chain, below) = if sync {
+            (resolve_existing(cache, rel_parent, path)?, PathBuf::new())
+        } else {
+            cache.resolve_cached(rel_parent)?
+        };
         let parent = last(&chain);
         let unlink = if sync {
             dir_cache::unlink_in
         } else {
             dir_cache::unlink_unsynced
         };
-        unlink(parent, name).map_err(|e| match e {
+        unlink(parent, below.join(name).as_os_str()).map_err(|e| match e {
             Errno::ENOENT => entry_error(cache, parent, e, |source| Error::NotFound {
                 path: path.to_path_buf(),
                 source,
@@ -426,6 +432,13 @@ pub(super) fn delete(
         }
         if automatic_cleanup {
             // Deepest first, stopping at the first directory that is not empty (or is the root).
+            let below_removed = below
+                .ancestors()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .all(|dir| dir_cache::rmdir_in(parent, dir.as_os_str()).is_ok());
+            if !below_removed {
+                return Ok(());
+            }
             for (dir, grandparent) in chain.iter().skip(1).zip(chain.iter()).rev() {
                 let Some(name) = dir.rel().file_name() else {
                     break;

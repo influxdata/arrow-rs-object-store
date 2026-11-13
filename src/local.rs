@@ -2100,6 +2100,7 @@ mod tests {
         async fn fsync_delete_retries_a_stale_handle() {
             let tmp = TempDir::new().unwrap();
             let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
             let location = Path::from("a/b/f");
             store.put(&location, "1".into()).await.unwrap();
             let old_b = cached(&store, "a/b");
@@ -2114,7 +2115,8 @@ mod tests {
             fs::write(b.join("f"), "2").unwrap();
             store.delete(&location).await.unwrap();
             assert!(!b.join("f").exists());
-            assert!(!Arc::ptr_eq(&old_b, &cached(&store, "a/b")));
+            // Evicted, and not reopened: the retry went through `a`.
+            assert!(cache.cached(std::path::Path::new("a/b")).is_none());
         }
 
         #[tokio::test]
@@ -2138,6 +2140,32 @@ mod tests {
             // Recreated from scratch; the root's changed entry is synced by the put.
             store.put(&location, "again".into()).await.unwrap();
             assert!(!cached(&store, "").is_dirty());
+        }
+
+        /// A delete without a sync opens no directory below the cached chain: the object and the
+        /// directories it leaves empty go through the deepest cached ancestor.
+        #[tokio::test]
+        async fn fsync_delete_opens_no_uncached_directory() {
+            let tmp = TempDir::new().unwrap();
+            fsync_store(&tmp)
+                .put(&Path::from("a/b/c/f"), "1".into())
+                .await
+                .unwrap();
+            fsync_store(&tmp)
+                .put(&Path::from("a/keep"), "1".into())
+                .await
+                .unwrap();
+
+            let store = fsync_store(&tmp).with_automatic_cleanup(true);
+            store.delete(&Path::from("a/b/c/f")).await.unwrap();
+            assert_eq!(store.config.dirs.len(), 1, "only the root is cached");
+            assert!(!tmp.path().join("a/b").exists());
+            assert!(tmp.path().join("a/keep").exists());
+            assert!(matches!(
+                store.delete(&Path::from("a/b/c/f")).await.unwrap_err(),
+                crate::Error::NotFound { .. }
+            ));
+            assert_eq!(store.config.dirs.len(), 1);
         }
 
         #[tokio::test]

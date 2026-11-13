@@ -321,6 +321,43 @@ impl DirCache {
         Ok(chain)
     }
 
+    /// The cached handles from the root down `rel` as far as they reach, and the rest of `rel`.
+    /// Opens nothing but the root.
+    pub(super) fn resolve_cached(
+        &self,
+        rel: &Path,
+    ) -> Result<(Vec<Arc<DirHandle>>, PathBuf), DirError> {
+        let mut chain = vec![self.root_handle()?];
+        let mut key = PathBuf::new();
+        let mut rest = PathBuf::new();
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            key.push(name);
+            if rest.as_os_str().is_empty() {
+                let parent = chain.last().expect("the root is always present");
+                if let Some(handle) = self.cached_child(parent, &key) {
+                    chain.push(handle);
+                    continue;
+                }
+            }
+            rest.push(name);
+        }
+        Ok((chain, rest))
+    }
+
+    /// The cached handle for `key` if it was opened under `parent`.
+    fn cached_child(&self, parent: &DirHandle, key: &Path) -> Option<Arc<DirHandle>> {
+        let inner = self.inner.lock();
+        let handle = inner.dirs.get(key)?;
+        if handle.parent != Some(parent.inode) {
+            return None;
+        }
+        handle.used.store(true, Ordering::Relaxed);
+        Some(Arc::clone(handle))
+    }
+
     /// The cached handle for `rel`, if any.
     #[cfg(test)]
     pub(super) fn cached(&self, rel: &Path) -> Option<Arc<DirHandle>> {
@@ -415,11 +452,8 @@ impl DirCache {
         name: &OsStr,
         create: bool,
     ) -> Result<Arc<DirHandle>, DirError> {
-        if let Some(handle) = self.inner.lock().dirs.get(key) {
-            if handle.parent == Some(parent.inode) {
-                handle.used.store(true, Ordering::Relaxed);
-                return Ok(Arc::clone(handle));
-            }
+        if let Some(handle) = self.cached_child(parent, key) {
+            return Ok(handle);
         }
         let path = parent.path.join(name);
         let open_error = |e: Errno| {
