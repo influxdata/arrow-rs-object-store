@@ -401,9 +401,11 @@ pub(super) fn rename(
                 .into(),
             });
         // A renamed directory's handle still answers to its old path, whatever the fsyncs do.
-        if renamed.is_ok() {
-            cache.evict_moved(&from_rel.join(from_name));
-        }
+        let renamed = renamed.and_then(|()| {
+            cache
+                .evict_moved(&from_rel.join(from_name))
+                .map_err(Attempt::from)
+        });
         synced(&from_chain, synced(&to_chain, renamed))
     })
 }
