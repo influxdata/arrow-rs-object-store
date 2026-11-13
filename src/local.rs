@@ -2293,12 +2293,14 @@ mod tests {
             }
             .with_best_effort_root_parent_sync(true);
 
-            let refused = [
+            let mut refused = vec![
                 strict.put(&Path::from("x"), "1".into()).await,
                 strict.put(&Path::from("x"), "1".into()).await,
             ];
             let written = lenient.put(&Path::from("x"), "1".into()).await;
             let read = lenient.get(&Path::from("x")).await;
+            // The lenient clone cached the root without the parent fsync; `strict` still owes it.
+            refused.push(strict.put(&Path::from("z"), "3".into()).await);
             fs::remove_dir_all(&root).unwrap();
             let recreated = lenient.put(&Path::from("y"), "2".into()).await;
             fs::set_permissions(&parent, original_permissions).unwrap();
