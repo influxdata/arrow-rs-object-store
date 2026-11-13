@@ -71,6 +71,8 @@ pub(super) enum DirError {
 pub(super) struct DirCache {
     root: PathBuf,
     inner: Mutex<Inner>,
+    /// Whether the directory holding the root was fsynced since the root was opened.
+    root_parent_synced: AtomicBool,
     /// Makes every `ENOENT` look like a removed directory.
     #[cfg(test)]
     force_stale: AtomicBool,
@@ -242,6 +244,7 @@ impl DirCache {
                 dirs: HashMap::new(),
                 clock: VecDeque::new(),
             }),
+            root_parent_synced: AtomicBool::new(false),
             #[cfg(test)]
             force_stale: AtomicBool::new(false),
         }
@@ -378,6 +381,9 @@ impl DirCache {
                 _ => None,
             }
         };
+        if removed.is_some() && handle.rel.as_os_str().is_empty() {
+            self.root_parent_synced.store(false, Ordering::Relaxed);
+        }
         // Closes the descriptor, outside the lock.
         drop(removed);
     }
@@ -408,11 +414,15 @@ impl DirCache {
     /// by the operation that notices and recreated here on the retry, as the path-based code
     /// does. Whoever opens an uncached root fsyncs the directory holding its entry: another
     /// thread may have just created it and not synced it yet; with `best_effort_root` a parent
-    /// that cannot be opened is skipped.
+    /// that cannot be opened is skipped, and a later caller without it does the fsync.
     fn root_handle(&self, best_effort_root: bool) -> Result<Arc<DirHandle>, DirError> {
         let key = PathBuf::new();
-        if let Some(root) = self.inner.lock().dirs.get(&key) {
-            return Ok(Arc::clone(root));
+        let cached = self.inner.lock().dirs.get(&key).cloned();
+        if let Some(root) = cached {
+            if !best_effort_root && !self.root_parent_synced.load(Ordering::Relaxed) {
+                self.sync_root_parent(false)?;
+            }
+            return Ok(root);
         }
         let open_error = |e: Errno| DirError::Open {
             dir: self.root.clone(),
@@ -430,15 +440,7 @@ impl DirCache {
             }
             other => other.map_err(open_error)?,
         };
-        if let Some(parent) = self.root.parent() {
-            match super::fsync_dir(parent) {
-                Err(e) if best_effort_root && e.kind() == io::ErrorKind::PermissionDenied => {}
-                other => other.map_err(|source| DirError::RootParentSync {
-                    dir: parent.to_path_buf(),
-                    source,
-                })?,
-            }
-        }
+        self.sync_root_parent(best_effort_root)?;
         let handle =
             DirHandle::new(key.clone(), self.root.clone(), fd, None).map_err(open_error)?;
         let handle = Arc::new(handle);
@@ -453,6 +455,25 @@ impl DirCache {
         inner.dirs.insert(key, Arc::clone(&handle));
         drop(inner);
         Ok(handle)
+    }
+
+    /// Fsyncs the directory holding the root and records the success; with `best_effort_root` a
+    /// directory that cannot be opened is left alone, unrecorded.
+    fn sync_root_parent(&self, best_effort_root: bool) -> Result<(), DirError> {
+        let Some(parent) = self.root.parent() else {
+            return Ok(());
+        };
+        match super::fsync_dir(parent) {
+            Ok(()) => {
+                self.root_parent_synced.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) if best_effort_root && e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(source) => Err(DirError::RootParentSync {
+                dir: parent.to_path_buf(),
+                source,
+            }),
+        }
     }
 
     /// The handle for `key`, the entry `name` of `parent`. A cached handle opened under another
