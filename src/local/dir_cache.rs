@@ -64,6 +64,8 @@ pub(super) enum DirError {
     Create { dir: PathBuf, source: io::Error },
     /// A directory on the chain could not be fsynced.
     Sync { dir: PathBuf, source: io::Error },
+    /// The directory holding the root could not be fsynced.
+    RootParentSync { dir: PathBuf, source: io::Error },
 }
 
 pub(super) struct DirCache {
@@ -292,13 +294,14 @@ impl DirCache {
     }
 
     /// The handles from the root down to `rel`, opening (and with `create`, making) the
-    /// directories not yet cached.
+    /// directories not yet cached. `best_effort_root` is the store's root-parent policy.
     pub(super) fn resolve(
         &self,
         rel: &Path,
         create: bool,
+        best_effort_root: bool,
     ) -> Result<Vec<Arc<DirHandle>>, DirError> {
-        let mut chain = vec![self.root_handle()?];
+        let mut chain = vec![self.root_handle(best_effort_root)?];
         let mut key = PathBuf::new();
         for component in rel.components() {
             let Component::Normal(name) = component else {
@@ -326,8 +329,9 @@ impl DirCache {
     pub(super) fn resolve_cached(
         &self,
         rel: &Path,
+        best_effort_root: bool,
     ) -> Result<(Vec<Arc<DirHandle>>, PathBuf), DirError> {
-        let mut chain = vec![self.root_handle()?];
+        let mut chain = vec![self.root_handle(best_effort_root)?];
         let mut key = PathBuf::new();
         let mut rest = PathBuf::new();
         for component in rel.components() {
@@ -403,9 +407,9 @@ impl DirCache {
     /// The root handle, opened on first use. A root removed behind the cache is reported stale
     /// by the operation that notices and recreated here on the retry, as the path-based code
     /// does. Whoever opens an uncached root fsyncs the directory holding its entry: another
-    /// thread may have just created it and not synced it yet. A parent this store may not open
-    /// (traverse-only permissions) is left alone unless this call created the root.
-    fn root_handle(&self) -> Result<Arc<DirHandle>, DirError> {
+    /// thread may have just created it and not synced it yet; with `best_effort_root` a parent
+    /// that cannot be opened is skipped.
+    fn root_handle(&self, best_effort_root: bool) -> Result<Arc<DirHandle>, DirError> {
         let key = PathBuf::new();
         if let Some(root) = self.inner.lock().dirs.get(&key) {
             return Ok(Arc::clone(root));
@@ -414,7 +418,6 @@ impl DirCache {
             dir: self.root.clone(),
             source: e.into(),
         };
-        let mut created = false;
         let fd = match open(&self.root, DIR_FLAGS, Mode::empty()) {
             Err(Errno::ENOENT) => {
                 // Creates and fsyncs every missing ancestor and the first existing one.
@@ -423,15 +426,14 @@ impl DirCache {
                         dir: self.root.clone(),
                         source: io::Error::other(e),
                     })?;
-                created = true;
                 open(&self.root, DIR_FLAGS, Mode::empty()).map_err(open_error)?
             }
             other => other.map_err(open_error)?,
         };
         if let Some(parent) = self.root.parent() {
             match super::fsync_dir(parent) {
-                Err(e) if !created && e.kind() == io::ErrorKind::PermissionDenied => {}
-                other => other.map_err(|source| DirError::Sync {
+                Err(e) if best_effort_root && e.kind() == io::ErrorKind::PermissionDenied => {}
+                other => other.map_err(|source| DirError::RootParentSync {
                     dir: parent.to_path_buf(),
                     source,
                 })?,

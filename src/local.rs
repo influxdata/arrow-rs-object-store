@@ -127,6 +127,14 @@ pub(crate) enum Error {
     #[error("Unable to sync data to disk for {}: {}", path.display(), source)]
     UnableToSyncFile { source: io::Error, path: PathBuf },
 
+    #[error(
+        "Unable to sync the directory holding the store root, {}: {}; \
+         LocalFileSystem::with_best_effort_root_parent_sync(true) skips it",
+        path.display(),
+        source
+    )]
+    UnableToSyncRootParent { source: io::Error, path: PathBuf },
+
     #[error("Upload aborted")]
     Aborted,
 }
@@ -264,6 +272,8 @@ pub struct LocalFileSystem {
     automatic_cleanup: bool,
     // if true, fsync written files and their parent directories after writes
     fsync: bool,
+    // if true, a root parent that cannot be opened is not fsynced
+    best_effort_root_parent_sync: bool,
 }
 
 #[derive(Debug)]
@@ -308,6 +318,7 @@ impl LocalFileSystem {
             config: Arc::new(Config::new(Url::parse("file:///").unwrap()).unwrap()),
             automatic_cleanup: false,
             fsync: false,
+            best_effort_root_parent_sync: false,
         }
     }
 
@@ -325,6 +336,7 @@ impl LocalFileSystem {
             config: Arc::new(Config::new(absolute_path_to_url(path)?)?),
             automatic_cleanup: false,
             fsync: false,
+            best_effort_root_parent_sync: false,
         })
     }
 
@@ -365,6 +377,21 @@ impl LocalFileSystem {
     /// moved or re-targeted outside the store (a rename, a symlink change) are not detected.
     pub fn with_fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
+        self
+    }
+
+    /// Skip the fsync of the directory holding the store root when that directory cannot be
+    /// opened (traverse-only permissions, such as a `0711` home directory)
+    ///
+    /// With [`with_fsync`](Self::with_fsync) on Linux, the store fsyncs the root's parent
+    /// directory when it first opens the root (and whenever it reopens a root that was removed
+    /// and recreated), so the root's own directory entry is durable; a parent it cannot open fails
+    /// every write with a sync error naming that directory. With this option such a permission
+    /// error is skipped instead, and the root's directory entry may then not survive a power
+    /// loss. Other errors are still reported. The option has no effect on other targets, where
+    /// the path-based code fsyncs only the directories it creates. **Disabled by default**.
+    pub fn with_best_effort_root_parent_sync(mut self, best_effort: bool) -> Self {
+        self.best_effort_root_parent_sync = best_effort;
         self
     }
 }
@@ -457,11 +484,12 @@ impl ObjectStore for LocalFileSystem {
         let path = self.path_to_filesystem(location)?;
         let fsync = self.fsync;
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        let config = Arc::clone(&self.config);
+        let (config, best_effort_root) =
+            (Arc::clone(&self.config), self.best_effort_root_parent_sync);
         maybe_spawn_blocking(move || {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             if fsync {
-                return durable::put(&config, &path, payload, &opts.mode);
+                return durable::put(&config, best_effort_root, &path, payload, &opts.mode);
             }
             let (mut file, staging_path) = new_staged_upload(&path, fsync)?;
             if let Err(source) = payload.iter().try_for_each(|x| file.write_all(x)) {
@@ -503,10 +531,12 @@ impl ObjectStore for LocalFileSystem {
         let dest = self.path_to_filesystem(location)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.fsync {
-            let config = Arc::clone(&self.config);
+            let (config, best_effort_root) =
+                (Arc::clone(&self.config), self.best_effort_root_parent_sync);
             let staged = dest.clone();
             let (file, upload) =
-                maybe_spawn_blocking(move || durable::stage(&config, &staged)).await?;
+                maybe_spawn_blocking(move || durable::stage(&config, best_effort_root, &staged))
+                    .await?;
             let staged = Staged::Durable(upload);
             return Ok(Box::new(LocalUpload::new(staged, dest, file, true)));
         }
@@ -563,6 +593,7 @@ impl ObjectStore for LocalFileSystem {
         let config = Arc::clone(&self.config);
         let automatic_cleanup = self.automatic_cleanup;
         let fsync = self.fsync;
+        let best_effort_root = self.best_effort_root_parent_sync;
         locations
             .map(move |location| {
                 let config = Arc::clone(&config);
@@ -570,7 +601,8 @@ impl ObjectStore for LocalFileSystem {
                     let location = location?;
                     // `with_fsync` does not apply to standalone deletes; only create-mode rename
                     // fsyncs its internal source removal as part of the durable copy-and-delete.
-                    Self::delete_location(config, automatic_cleanup, &location, fsync, false)?;
+                    let durable = (fsync, false, best_effort_root);
+                    Self::delete_location(config, automatic_cleanup, &location, durable)?;
                     Ok(location)
                 })
             })
@@ -653,8 +685,12 @@ impl ObjectStore for LocalFileSystem {
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if fsync {
-            let config = Arc::clone(&self.config);
-            return maybe_spawn_blocking(move || durable::copy(&config, &from, &to, mode)).await;
+            let (config, best_effort_root) =
+                (Arc::clone(&self.config), self.best_effort_root_parent_sync);
+            return maybe_spawn_blocking(move || {
+                durable::copy(&config, best_effort_root, &from, &to, mode)
+            })
+            .await;
         }
 
         match mode {
@@ -749,9 +785,12 @@ impl ObjectStore for LocalFileSystem {
                 let fsync = self.fsync;
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 if fsync {
-                    let config = Arc::clone(&self.config);
-                    return maybe_spawn_blocking(move || durable::rename(&config, &from, &to))
-                        .await;
+                    let (config, best_effort_root) =
+                        (Arc::clone(&self.config), self.best_effort_root_parent_sync);
+                    return maybe_spawn_blocking(move || {
+                        durable::rename(&config, best_effort_root, &from, &to)
+                    })
+                    .await;
                 }
                 maybe_spawn_blocking(move || {
                     loop {
@@ -790,10 +829,10 @@ impl ObjectStore for LocalFileSystem {
                 .await?;
                 let config = Arc::clone(&self.config);
                 let automatic_cleanup = self.automatic_cleanup;
-                let fsync = self.fsync;
+                let durable = (self.fsync, self.fsync, self.best_effort_root_parent_sync);
                 let from = from.clone();
                 maybe_spawn_blocking(move || {
-                    Self::delete_location(config, automatic_cleanup, &from, fsync, fsync)
+                    Self::delete_location(config, automatic_cleanup, &from, durable)
                 })
                 .await?;
                 Ok(())
@@ -803,22 +842,23 @@ impl ObjectStore for LocalFileSystem {
 }
 
 impl LocalFileSystem {
-    /// Deletes `location`. With `fsync` the store is durable and the change goes through its
-    /// directory handles; with `sync` the parent directory is fsynced afterwards.
+    /// Deletes `location`. `durable` is `(fsync, sync, best_effort_root_parent_sync)`: with
+    /// `fsync` the store is durable and the change goes through its directory handles; with
+    /// `sync` the parent directory is fsynced afterwards.
     fn delete_location(
         config: Arc<Config>,
         automatic_cleanup: bool,
         location: &Path,
-        fsync: bool,
-        sync: bool,
+        durable: (bool, bool, bool),
     ) -> Result<()> {
+        let (fsync, sync, best_effort_root) = durable;
         let path = config.path_to_filesystem(location)?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if fsync {
-            return durable::delete(&config, &path, automatic_cleanup, sync);
+            return durable::delete(&config, best_effort_root, &path, automatic_cleanup, sync);
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let _ = fsync;
+        let _ = (fsync, best_effort_root);
         if let Err(e) = std::fs::remove_file(&path) {
             Err(match e.kind() {
                 ErrorKind::NotFound => Error::NotFound { path, source: e }.into(),
@@ -1770,7 +1810,7 @@ mod tests {
             let root = store
                 .config
                 .dirs
-                .resolve(std::path::Path::new(""), false)
+                .resolve(std::path::Path::new(""), false, false)
                 .unwrap()
                 .pop()
                 .unwrap();
@@ -2223,7 +2263,9 @@ mod tests {
             let cache = &store.config.dirs;
             cache.set_capacity(4);
 
-            let held = cache.resolve(std::path::Path::new("a"), true).unwrap();
+            let held = cache
+                .resolve(std::path::Path::new("a"), true, false)
+                .unwrap();
             for i in 0..10 {
                 let location = Path::from(format!("d{i}/f"));
                 store.put(&location, "x".into()).await.unwrap();
@@ -2365,8 +2407,9 @@ mod tests {
             assert_eq!(fs::read_dir(tmp.path().join("a")).unwrap().count(), 0);
         }
 
-        /// A store whose root sits under a directory it may traverse but not open writes
-        /// without fsyncing that directory; creating the root under it still has to.
+        /// A store whose root sits under a directory it may traverse but not open fails every
+        /// write, naming that directory, unless it opts out of fsyncing it; creating the root
+        /// under it still has to.
         #[tokio::test]
         async fn fsync_root_under_an_unreadable_parent() {
             // SAFETY: `geteuid` has no preconditions.
@@ -2379,23 +2422,45 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             let original_permissions = fs::metadata(&parent).unwrap().permissions();
             fs::set_permissions(&parent, fs::Permissions::from_mode(0o311)).unwrap();
-            let store = LocalFileSystem::new_with_prefix(&root)
+            let strict = LocalFileSystem::new_with_prefix(&root)
                 .unwrap()
                 .with_fsync(true);
+            // Set on a clone: `strict` keeps its setting.
+            let lenient = strict.clone().with_best_effort_root_parent_sync(true);
 
-            let written = store.put(&Path::from("x"), "1".into()).await;
-            let read = store.get(&Path::from("x")).await;
+            let refused = [
+                strict.put(&Path::from("x"), "1".into()).await,
+                strict.put(&Path::from("x"), "1".into()).await,
+            ];
+            let written = lenient.put(&Path::from("x"), "1".into()).await;
+            let read = lenient.get(&Path::from("x")).await;
             fs::remove_dir_all(&root).unwrap();
-            let recreated = store.put(&Path::from("y"), "2".into()).await;
+            let recreated = lenient.put(&Path::from("y"), "2".into()).await;
             fs::set_permissions(&parent, original_permissions).unwrap();
 
+            for result in refused {
+                let err = local_error(result.unwrap_err());
+                let message = err.to_string();
+                assert!(
+                    message.contains("with_best_effort_root_parent_sync"),
+                    "{message}"
+                );
+                match err {
+                    Error::UnableToSyncRootParent { path, source } => {
+                        assert_eq!(path, parent);
+                        assert_eq!(source.kind(), ErrorKind::PermissionDenied);
+                        assert_eq!(source.raw_os_error(), Some(nix::libc::EACCES));
+                    }
+                    e => panic!("expected the parent sync to fail, got {e}"),
+                }
+            }
             written.unwrap();
             assert_eq!(read.unwrap().bytes().await.unwrap(), Bytes::from("1"));
             match local_error(recreated.unwrap_err()) {
                 Error::UnableToCreateDir { path, .. } => assert_eq!(path, root),
                 e => panic!("expected the root creation to fail, got {e}"),
             }
-            store.put(&Path::from("y"), "2".into()).await.unwrap();
+            strict.put(&Path::from("y"), "2".into()).await.unwrap();
         }
 
         /// A root removed behind the cache is recreated by the next write, as the path-based

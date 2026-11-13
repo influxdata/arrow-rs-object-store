@@ -69,6 +69,9 @@ impl From<DirError> for crate::Error {
             DirError::Open { dir, source } => Error::UnableToOpenFile { source, path: dir },
             DirError::Create { dir, source } => Error::UnableToCreateDir { source, path: dir },
             DirError::Sync { dir, source } => Error::UnableToSyncFile { source, path: dir },
+            DirError::RootParentSync { dir, source } => {
+                Error::UnableToSyncRootParent { source, path: dir }
+            }
         }
         .into()
     }
@@ -138,27 +141,33 @@ fn last(chain: &[Arc<DirHandle>]) -> &Arc<DirHandle> {
 /// The handles down to the existing directory `rel`; a missing one is reported as `path` not found.
 fn resolve_existing(
     cache: &DirCache,
+    best_effort_root: bool,
     rel: &std::path::Path,
     path: &std::path::Path,
 ) -> Result<Vec<Arc<DirHandle>>, Attempt> {
-    cache.resolve(rel, false).map_err(|e| match e {
-        DirError::Open { source, .. } if source.kind() == ErrorKind::NotFound => Error::NotFound {
-            path: path.to_path_buf(),
-            source,
-        }
-        .into(),
-        e => e.into(),
-    })
+    cache
+        .resolve(rel, false, best_effort_root)
+        .map_err(|e| match e {
+            DirError::Open { source, .. } if source.kind() == ErrorKind::NotFound => {
+                Error::NotFound {
+                    path: path.to_path_buf(),
+                    source,
+                }
+                .into()
+            }
+            e => e.into(),
+        })
 }
 
 /// The handles down to `rel`, the destination directory of a copy or rename of `from`, made only
 /// when `from` exists so a missing source leaves no directories behind.
 fn resolve_destination(
     cache: &DirCache,
+    best_effort_root: bool,
     rel: &std::path::Path,
     from: &std::path::Path,
 ) -> Result<Vec<Arc<DirHandle>>, Attempt> {
-    match cache.resolve(rel, false) {
+    match cache.resolve(rel, false, best_effort_root) {
         Err(DirError::Open { source, .. }) if source.kind() == ErrorKind::NotFound => {
             if !from.exists() {
                 return Err(Error::NotFound {
@@ -167,7 +176,7 @@ fn resolve_destination(
                 }
                 .into());
             }
-            Ok(cache.resolve(rel, true)?)
+            Ok(cache.resolve(rel, true, best_effort_root)?)
         }
         chain => Ok(chain?),
     }
@@ -284,6 +293,7 @@ fn put_result(metadata: Metadata) -> PutResult {
 /// it as `path` by rename (`Overwrite`) or hard link (`Create`).
 pub(super) fn put(
     config: &Config,
+    best_effort_root: bool,
     path: &std::path::Path,
     payload: PutPayload,
     mode: &PutMode,
@@ -291,7 +301,7 @@ pub(super) fn put(
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, path)?;
     let metadata = retrying(cache, rel_parent, || {
-        let chain = cache.resolve(rel_parent, true)?;
+        let chain = cache.resolve(rel_parent, true, best_effort_root)?;
         let parent = last(&chain);
         let published = stage_file(cache, parent, name, path).and_then(|(mut file, staging)| {
             let staging_path = staging.path();
@@ -316,6 +326,7 @@ pub(super) fn put(
 /// Hard-links `from` to `to`, via a staging link and a rename for `Overwrite`.
 pub(super) fn copy(
     config: &Config,
+    best_effort_root: bool,
     from: &std::path::Path,
     to: &std::path::Path,
     mode: CopyMode,
@@ -323,7 +334,7 @@ pub(super) fn copy(
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, to)?;
     retrying(cache, rel_parent, || {
-        let chain = resolve_destination(cache, rel_parent, from)?;
+        let chain = resolve_destination(cache, best_effort_root, rel_parent, from)?;
         let parent = last(&chain);
         let linked = match mode {
             CopyMode::Create => dir_cache::link_from_path(parent, from, name),
@@ -355,14 +366,19 @@ pub(super) fn copy(
 }
 
 /// Renames `from` to `to`, replacing `to`, and fsyncs both directories.
-pub(super) fn rename(config: &Config, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+pub(super) fn rename(
+    config: &Config,
+    best_effort_root: bool,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<()> {
     let cache = &config.dirs;
     let (from_rel, from_name) = split(cache, from)?;
     let (to_rel, to_name) = split(cache, to)?;
     let deeper = std::cmp::max_by_key(from_rel, to_rel, |rel| rel.components().count());
     retrying(cache, deeper, || {
-        let from_chain = resolve_existing(cache, from_rel, from)?;
-        let to_chain = resolve_destination(cache, to_rel, from)?;
+        let from_chain = resolve_existing(cache, best_effort_root, from_rel, from)?;
+        let to_chain = resolve_destination(cache, best_effort_root, to_rel, from)?;
         let (from_dir, to_dir) = (last(&from_chain), last(&to_chain));
         let renamed =
             dir_cache::rename_between(from_dir, from_name, to_dir, to_name).map_err(|e| match e {
@@ -398,6 +414,7 @@ pub(super) fn rename(config: &Config, from: &std::path::Path, to: &std::path::Pa
 /// the deepest cached ancestor.
 pub(super) fn delete(
     config: &Config,
+    best_effort_root: bool,
     path: &std::path::Path,
     automatic_cleanup: bool,
     sync: bool,
@@ -406,9 +423,12 @@ pub(super) fn delete(
     let (rel_parent, name) = split(cache, path)?;
     retrying(cache, rel_parent, || {
         let (chain, below) = if sync {
-            (resolve_existing(cache, rel_parent, path)?, PathBuf::new())
+            (
+                resolve_existing(cache, best_effort_root, rel_parent, path)?,
+                PathBuf::new(),
+            )
         } else {
-            cache.resolve_cached(rel_parent)?
+            cache.resolve_cached(rel_parent, best_effort_root)?
         };
         let parent = last(&chain);
         let unlink = if sync {
@@ -477,11 +497,15 @@ impl std::fmt::Debug for Upload {
 
 /// Creates the staging file for a multipart upload to `dest`. Its directory stays dirty until the
 /// upload completes or is discarded.
-pub(super) fn stage(config: &Config, dest: &std::path::Path) -> Result<(File, Upload)> {
+pub(super) fn stage(
+    config: &Config,
+    best_effort_root: bool,
+    dest: &std::path::Path,
+) -> Result<(File, Upload)> {
     let cache = &config.dirs;
     let (rel_parent, name) = split(cache, dest)?;
     retrying(cache, rel_parent, || {
-        let chain = cache.resolve(rel_parent, true)?;
+        let chain = cache.resolve(rel_parent, true, best_effort_root)?;
         let parent = last(&chain);
         match stage_file(cache, parent, name, dest) {
             Ok((file, staging)) => Ok((
