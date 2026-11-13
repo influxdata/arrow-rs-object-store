@@ -45,6 +45,9 @@ use parking_lot::Mutex;
 const CAPACITY: usize = 4096;
 const MIN_CAPACITY: usize = 16;
 
+/// Attempts to make a directory that keeps disappearing between its creation and its open.
+const CREATE_ATTEMPTS: usize = 16;
+
 const DIR_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_CLOEXEC);
@@ -510,6 +513,7 @@ impl DirCache {
                 source: e.into(),
             })
         };
+        let mut attempts = 0;
         let fd = loop {
             match openat(&parent.fd, name, DIR_FLAGS, Mode::empty()) {
                 Ok(fd) => break fd,
@@ -533,8 +537,14 @@ impl DirCache {
                 })?;
             match openat(&parent.fd, name, DIR_FLAGS, Mode::empty()) {
                 Ok(fd) => break fd,
-                // Removed again since this call made it: make it again.
-                Err(Errno::ENOENT) if made => continue,
+                // Removed again since this call made it: make it again, a bounded number of times.
+                Err(Errno::ENOENT) if made && attempts < CREATE_ATTEMPTS => attempts += 1,
+                Err(Errno::ENOENT) if made => {
+                    return Err(DirError::Create {
+                        dir: path.clone(),
+                        source: Errno::ENOENT.into(),
+                    });
+                }
                 Err(e) => return Err(open_error(e)),
             }
         };
