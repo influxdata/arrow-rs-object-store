@@ -352,9 +352,17 @@ impl LocalFileSystem {
     /// This trades write throughput for durability and is **disabled by default**.
     ///
     /// Note that directory fsync is only performed on Unix; on other platforms (e.g. Windows)
-    /// it is a no-op, as directories cannot be portably opened and synced. On Linux the store
-    /// keeps the directories it writes to open (a bounded number of descriptors per store) and
-    /// also fsyncs a directory whose entries another, still unfinished write of this store changed.
+    /// it is a no-op, as directories cannot be portably opened and synced.
+    ///
+    /// On Linux the store keeps the directories it writes to open (up to a few thousand
+    /// descriptors, plus those of directories with changes not yet fsynced or in use by a write)
+    /// and also fsyncs a directory whose entries another, still unfinished write changed. That
+    /// coordination is per store: clones share it, while separate [`LocalFileSystem`] instances
+    /// on the same root, other processes, writes through another path to the same directory (a
+    /// symlink, or different case on a case-insensitive filesystem) and stores with `fsync` off
+    /// are not coordinated and can return before a directory they created is durable. For the
+    /// same reason, stores with different `fsync` settings must not share a root. Directories
+    /// moved or re-targeted outside the store (a rename, a symlink change) are not detected.
     pub fn with_fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
         self
@@ -1712,7 +1720,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         use super::*;
-        use crate::local::dir_cache::DirHandle;
+        use crate::local::dir_cache::{DirError, DirHandle};
 
         fn fsync_store(root: &TempDir) -> LocalFileSystem {
             LocalFileSystem::new_with_prefix(root.path())
@@ -2165,6 +2173,130 @@ mod tests {
             assert!(!cached(&store, "a/b").is_dirty());
         }
 
+        /// A handle an operation holds is never evicted, so a write after it still sees the
+        /// changes it records.
+        #[tokio::test]
+        async fn fsync_cache_keeps_handles_an_operation_holds() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
+            cache.set_capacity(4);
+
+            let held = cache.resolve(std::path::Path::new("a"), true).unwrap();
+            for i in 0..10 {
+                let location = Path::from(format!("d{i}/f"));
+                store.put(&location, "x".into()).await.unwrap();
+            }
+            assert!(Arc::ptr_eq(&held[1], &cached(&store, "a")));
+
+            drop(held);
+            for i in 10..20 {
+                let location = Path::from(format!("d{i}/f"));
+                store.put(&location, "x".into()).await.unwrap();
+            }
+            assert!(cache.cached(std::path::Path::new("a")).is_none());
+        }
+
+        /// Evicting a stale handle leaves the live handle that replaced it alone.
+        #[tokio::test]
+        async fn fsync_evicting_a_stale_handle_spares_its_replacement() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            store.put(&Path::from("a/b/f"), "1".into()).await.unwrap();
+            let old = cached(&store, "a/b");
+            fs::remove_dir_all(tmp.path().join("a/b")).unwrap();
+            store.put(&Path::from("a/b/g"), "2".into()).await.unwrap();
+            let new = cached(&store, "a/b");
+            assert!(!Arc::ptr_eq(&old, &new));
+
+            store.config.dirs.evict(&old);
+            assert!(Arc::ptr_eq(&new, &cached(&store, "a/b")));
+        }
+
+        /// A cached directory is not served under the handle of a directory it was not opened
+        /// in: that handle is stale, and the chain restarts from the root.
+        #[tokio::test]
+        async fn fsync_cached_child_is_not_served_under_a_stale_parent() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
+            store.put(&Path::from("a/b/c/f"), "1".into()).await.unwrap();
+            let b1 = cached(&store, "a/b");
+            fs::remove_dir_all(tmp.path().join("a/b")).unwrap();
+            store.put(&Path::from("a/b/c/g"), "2".into()).await.unwrap();
+            let (b2, c2) = (cached(&store, "a/b"), cached(&store, "a/b/c"));
+
+            let (key, name) = (std::path::Path::new("a/b/c"), std::ffi::OsStr::new("c"));
+            let err = cache.child(&b1, key, name, false).unwrap_err();
+            assert!(matches!(err, DirError::Stale { dir } if Arc::ptr_eq(&dir, &b1)));
+            assert!(Arc::ptr_eq(
+                &c2,
+                &cache.child(&b2, key, name, false).unwrap()
+            ));
+        }
+
+        /// The eviction order does not grow with directories that left the cache.
+        #[tokio::test]
+        async fn fsync_cache_clock_stays_bounded() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp).with_automatic_cleanup(true);
+            let cache = &store.config.dirs;
+            let location = Path::from("a/b/f");
+            for _ in 0..200 {
+                store.put(&location, "x".into()).await.unwrap();
+                store.delete(&location).await.unwrap();
+            }
+            // At most twice the handles cached at once (root, `a`, `a/b`), plus the newest.
+            let clock = cache.clock_len();
+            assert!(clock <= 2 * 3 + 1, "{clock} clock entries after 200 cycles");
+        }
+
+        /// Renaming a directory moves its cached handles out from under their keys; the next
+        /// write at the old path makes a new directory.
+        #[tokio::test]
+        async fn fsync_rename_of_a_directory_evicts_its_handles() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let cache = &store.config.dirs;
+            store.put(&Path::from("a/b/x"), "1".into()).await.unwrap();
+            let a1 = cached(&store, "a");
+            store
+                .rename(&Path::from("a"), &Path::from("c"))
+                .await
+                .unwrap();
+            assert!(cache.cached(std::path::Path::new("a")).is_none());
+            assert!(cache.cached(std::path::Path::new("a/b")).is_none());
+            assert_eq!(read(&store, "c/b/x").await, Bytes::from("1"));
+
+            store.put(&Path::from("a/b/y"), "2".into()).await.unwrap();
+            assert_eq!(read(&store, "a/b/y").await, Bytes::from("2"));
+            assert!(matches!(
+                store.get(&Path::from("c/b/y")).await.unwrap_err(),
+                crate::Error::NotFound { .. }
+            ));
+            assert!(!Arc::ptr_eq(&a1, &cached(&store, "a")));
+        }
+
+        /// A root removed behind the cache is recreated by the next write, as the path-based
+        /// code does.
+        #[tokio::test]
+        async fn fsync_write_recreates_a_removed_root() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            store.put(&Path::from("x"), "1".into()).await.unwrap();
+            let old_root = cached(&store, "");
+            fs::remove_dir_all(tmp.path()).unwrap();
+
+            store.put(&Path::from("d/y"), "2".into()).await.unwrap();
+            assert_eq!(read(&store, "d/y").await, Bytes::from("2"));
+            assert!(!Arc::ptr_eq(&old_root, &cached(&store, "")));
+            assert!(!cached(&store, "").is_dirty());
+            assert!(matches!(
+                store.get(&Path::from("x")).await.unwrap_err(),
+                crate::Error::NotFound { .. }
+            ));
+        }
+
         /// Beyond its capacity the cache evicts clean handles and keeps dirty ones; writes into
         /// evicted directories reopen them.
         #[tokio::test]
@@ -2200,6 +2332,47 @@ mod tests {
             assert_eq!(read(&store, "d0/g").await, Bytes::from("y"));
             assert_eq!(read(&store, "d0/f").await, Bytes::from("x"));
         }
+    }
+
+    /// The path-based code fsyncs the source directory of a create-mode rename after removing
+    /// the source; a directory that cannot be opened fails that fsync.
+    #[tokio::test]
+    #[cfg(all(
+        target_family = "unix",
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    async fn fsync_rename_if_not_exists_propagates_source_delete_sync_error() {
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path())
+            .unwrap()
+            .with_fsync(true);
+
+        let source = Path::from("source_dir/source_file");
+        let dest = Path::from("dest_dir/dest_file");
+        integration.put(&source, "data".into()).await.unwrap();
+
+        let source_dir = root.path().join("source_dir");
+        let original_permissions = fs::metadata(&source_dir).unwrap().permissions();
+        // Allow unlinking the file from the directory, but prevent opening the directory for
+        // fsync.
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let result = integration.rename_if_not_exists(&source, &dest).await;
+        fs::set_permissions(&source_dir, original_permissions).unwrap();
+
+        match result {
+            Err(crate::Error::Generic { source, .. }) => {
+                assert!(source.to_string().contains("Unable to sync data to disk"));
+            }
+            _ => panic!("expected source parent fsync to fail"),
+        }
+
+        let read = integration.get(&dest).await.unwrap().bytes().await.unwrap();
+        assert_eq!(read, Bytes::from("data"));
+        assert!(matches!(
+            integration.get(&source).await.unwrap_err(),
+            crate::Error::NotFound { .. }
+        ));
     }
 
     #[test]

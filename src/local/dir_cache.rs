@@ -29,8 +29,8 @@ use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use nix::errno::Errno;
 use nix::fcntl::{AT_FDCWD, AtFlags, OFlag, open, openat, renameat};
@@ -40,7 +40,8 @@ use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 use parking_lot::Mutex;
 
 /// Handles kept open at most, before the clamp to a quarter of the soft `RLIMIT_NOFILE`. Clean
-/// handles beyond the capacity are evicted; dirty ones never are, so the cache can exceed it.
+/// handles beyond the capacity are evicted; dirty ones and ones an operation holds never are, so
+/// the cache can exceed it.
 const CAPACITY: usize = 4096;
 const MIN_CAPACITY: usize = 16;
 
@@ -48,12 +49,15 @@ const DIR_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_CLOEXEC);
 
+/// A directory's identity: device and inode.
+type Inode = (u64, u64);
+
 /// Why an operation through the cache failed.
 #[derive(Debug)]
 pub(super) enum DirError {
-    /// A cached handle refers to a directory that has been removed or replaced; `dir` is its path
-    /// relative to the root. Evict it and retry the operation from the root.
-    Stale { dir: PathBuf },
+    /// A cached handle refers to a directory that has been removed. Evict it and retry the
+    /// operation from the root.
+    Stale { dir: Arc<DirHandle> },
     /// A directory on the chain could not be opened.
     Open { dir: PathBuf, source: io::Error },
     /// A directory on the chain could not be created.
@@ -71,8 +75,9 @@ struct Inner {
     capacity: usize,
     /// Keyed by the path relative to the root; the root itself is the empty path.
     dirs: HashMap<PathBuf, Arc<DirHandle>>,
-    /// Eviction order (second chance): the root is never in it.
-    clock: VecDeque<PathBuf>,
+    /// Eviction order (second chance); entries no longer cached are skipped. The root is never
+    /// in it.
+    clock: VecDeque<Weak<DirHandle>>,
 }
 
 impl std::fmt::Debug for DirCache {
@@ -89,12 +94,24 @@ pub(super) struct DirHandle {
     /// Absolute, for error reports and staleness checks.
     path: PathBuf,
     fd: File,
+    inode: Inode,
+    /// The inode of the directory holding this one's entry when it was opened; `None` for the
+    /// root.
+    parent: Option<Inode>,
     used: AtomicBool,
     state: Mutex<DirState>,
     #[cfg(test)]
     pub(super) fsyncs: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pub(super) fail_syncs: AtomicBool,
+}
+
+impl std::fmt::Debug for DirHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirHandle")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -108,18 +125,22 @@ struct DirState {
 }
 
 impl DirHandle {
-    fn new(rel: PathBuf, path: PathBuf, fd: OwnedFd) -> Self {
-        Self {
+    fn new(rel: PathBuf, path: PathBuf, fd: OwnedFd, parent: Option<Inode>) -> nix::Result<Self> {
+        let fd = File::from(fd);
+        let inode = inode_of(&fd)?;
+        Ok(Self {
             rel,
             path,
-            fd: File::from(fd),
+            fd,
+            inode,
+            parent,
             used: AtomicBool::new(true),
             state: Mutex::default(),
             #[cfg(test)]
             fsyncs: Default::default(),
             #[cfg(test)]
             fail_syncs: Default::default(),
-        }
+        })
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -128,10 +149,6 @@ impl DirHandle {
 
     pub(super) fn rel(&self) -> &Path {
         &self.rel
-    }
-
-    fn is_root(&self) -> bool {
-        self.rel.as_os_str().is_empty()
     }
 
     /// Runs `op`, which changes this directory's entries through its descriptor, recording the
@@ -178,20 +195,29 @@ impl DirHandle {
     }
 
     /// `ENOENT` from an entry operation through this handle means the directory is gone (every
-    /// entry operation in a removed directory reports it) or the entry is. The handle is stale
-    /// when its path no longer names its inode.
-    pub(super) fn stale(&self, e: Errno) -> Option<DirError> {
-        (e == Errno::ENOENT && !self.is_root() && !self.is_current()).then(|| DirError::Stale {
-            dir: self.rel.clone(),
+    /// entry operation in a removed directory reports it) or the entry is.
+    pub(super) fn stale(self: &Arc<Self>, e: Errno) -> Option<DirError> {
+        (e == Errno::ENOENT && self.is_removed()).then(|| DirError::Stale {
+            dir: Arc::clone(self),
         })
     }
 
-    fn is_current(&self) -> bool {
-        match (fstat(&self.fd), stat(&self.path)) {
-            (Ok(open), Ok(named)) => open.st_dev == named.st_dev && open.st_ino == named.st_ino,
-            _ => false,
-        }
+    /// A removed directory keeps its inode while this descriptor is open, with no links left.
+    fn is_removed(&self) -> bool {
+        fstat(&self.fd).map(|s| s.st_nlink == 0).unwrap_or(true)
     }
+
+    /// Whether `path` still names this directory. A directory moved elsewhere is not removed,
+    /// so only this tells its handle from the one at its old path.
+    fn is_current(&self) -> bool {
+        stat(&self.path)
+            .map(|named| (named.st_dev, named.st_ino) == self.inode)
+            .unwrap_or(false)
+    }
+}
+
+fn inode_of(fd: &File) -> nix::Result<Inode> {
+    fstat(fd).map(|s| (s.st_dev, s.st_ino))
 }
 
 struct Changing<'a> {
@@ -229,6 +255,11 @@ impl DirCache {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.inner.lock().dirs.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn clock_len(&self) -> usize {
+        self.inner.lock().clock.len()
     }
 
     /// Splits an absolute path under the root into its parent directory (relative to the root)
@@ -275,27 +306,78 @@ impl DirCache {
         self.inner.lock().dirs.get(rel).cloned()
     }
 
-    /// Forgets `rel` and every directory under it.
-    pub(super) fn evict(&self, rel: &Path) {
-        let mut inner = self.inner.lock();
-        inner.dirs.retain(|key, _| !key.starts_with(rel));
+    /// Forgets `handle` if it is the one cached for its directory. Handles under it are replaced
+    /// as they are found under another parent or removed.
+    pub(super) fn evict(&self, handle: &Arc<DirHandle>) {
+        let removed = {
+            let mut inner = self.inner.lock();
+            match inner.dirs.get(&handle.rel) {
+                Some(cached) if Arc::ptr_eq(cached, handle) => inner.dirs.remove(&handle.rel),
+                _ => None,
+            }
+        };
+        // Closes the descriptor, outside the lock.
+        drop(removed);
     }
 
+    /// Forgets the handles at and under `rel` whose path no longer names their directory, after
+    /// the directory at `rel` was moved away.
+    pub(super) fn evict_moved(&self, rel: &Path) {
+        let moved: Vec<Arc<DirHandle>> = {
+            let inner = self.inner.lock();
+            inner
+                .dirs
+                .values()
+                .filter(|handle| handle.rel.starts_with(rel))
+                .cloned()
+                .collect()
+        };
+        for handle in moved {
+            if !handle.is_current() {
+                self.evict(&handle);
+            }
+        }
+    }
+
+    /// The root handle, opened on first use. A root removed behind the cache is reported stale
+    /// by the operation that notices and recreated here on the retry, as the path-based code
+    /// does, with its entry fsynced.
     fn root_handle(&self) -> Result<Arc<DirHandle>, DirError> {
         let key = PathBuf::new();
         if let Some(root) = self.inner.lock().dirs.get(&key) {
             return Ok(Arc::clone(root));
         }
-        let fd = open(&self.root, DIR_FLAGS, Mode::empty()).map_err(|e| DirError::Open {
+        let open_error = |e: Errno| DirError::Open {
             dir: self.root.clone(),
             source: e.into(),
-        })?;
-        let handle = Arc::new(DirHandle::new(key.clone(), self.root.clone(), fd));
+        };
+        let fd = match open(&self.root, DIR_FLAGS, Mode::empty()) {
+            Err(Errno::ENOENT) => {
+                std::fs::create_dir_all(&self.root).map_err(|source| DirError::Create {
+                    dir: self.root.clone(),
+                    source,
+                })?;
+                if let Some(parent) = self.root.parent() {
+                    super::fsync_dir(parent).map_err(|source| DirError::Sync {
+                        dir: parent.to_path_buf(),
+                        source,
+                    })?;
+                }
+                open(&self.root, DIR_FLAGS, Mode::empty()).map_err(open_error)?
+            }
+            other => other.map_err(open_error)?,
+        };
+        let handle =
+            DirHandle::new(key.clone(), self.root.clone(), fd, None).map_err(open_error)?;
         let mut inner = self.inner.lock();
-        Ok(Arc::clone(inner.dirs.entry(key).or_insert(handle)))
+        Ok(Arc::clone(
+            inner.dirs.entry(key).or_insert_with(|| Arc::new(handle)),
+        ))
     }
 
-    fn child(
+    /// The handle for `key`, the entry `name` of `parent`. A cached handle opened under another
+    /// directory than `parent` is not it: the one it was opened under was removed or replaced.
+    pub(super) fn child(
         &self,
         parent: &Arc<DirHandle>,
         key: &Path,
@@ -303,8 +385,10 @@ impl DirCache {
         create: bool,
     ) -> Result<Arc<DirHandle>, DirError> {
         if let Some(handle) = self.inner.lock().dirs.get(key) {
-            handle.used.store(true, Ordering::Relaxed);
-            return Ok(Arc::clone(handle));
+            if handle.parent == Some(parent.inode) {
+                handle.used.store(true, Ordering::Relaxed);
+                return Ok(Arc::clone(handle));
+            }
         }
         let path = parent.path.join(name);
         let open_error = |e: Errno| {
@@ -313,59 +397,103 @@ impl DirCache {
                 source: e.into(),
             })
         };
-        let fd = match openat(&parent.fd, name, DIR_FLAGS, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::ENOENT) if create => {
-                // The entry change is recorded on the parent before it becomes visible.
-                parent
-                    .change(
-                        |fd| match mkdirat(fd, name, Mode::from_bits_truncate(0o777)) {
-                            Err(Errno::EEXIST) => Ok(()),
-                            other => other,
-                        },
-                    )
-                    .map_err(|e| {
-                        parent.stale(e).unwrap_or_else(|| DirError::Create {
-                            dir: path.clone(),
-                            source: e.into(),
-                        })
-                    })?;
-                openat(&parent.fd, name, DIR_FLAGS, Mode::empty()).map_err(open_error)?
+        let fd = loop {
+            match openat(&parent.fd, name, DIR_FLAGS, Mode::empty()) {
+                Ok(fd) => break fd,
+                Err(Errno::ENOENT) if create => {}
+                Err(e) => return Err(open_error(e)),
             }
-            Err(e) => return Err(open_error(e)),
+            // The entry change is recorded on the parent before it becomes visible.
+            let made = parent
+                .change(
+                    |fd| match mkdirat(fd, name, Mode::from_bits_truncate(0o777)) {
+                        Ok(()) => Ok(true),
+                        Err(Errno::EEXIST) => Ok(false),
+                        Err(e) => Err(e),
+                    },
+                )
+                .map_err(|e| {
+                    parent.stale(e).unwrap_or_else(|| DirError::Create {
+                        dir: path.clone(),
+                        source: e.into(),
+                    })
+                })?;
+            match openat(&parent.fd, name, DIR_FLAGS, Mode::empty()) {
+                Ok(fd) => break fd,
+                // Removed again since this call made it: make it again.
+                Err(Errno::ENOENT) if made => continue,
+                Err(e) => return Err(open_error(e)),
+            }
         };
-        let handle = Arc::new(DirHandle::new(key.to_path_buf(), path, fd));
-        let mut inner = self.inner.lock();
-        if let Some(existing) = inner.dirs.get(key) {
-            return Ok(Arc::clone(existing));
-        }
-        inner.insert(key.to_path_buf(), Arc::clone(&handle));
+        let handle = DirHandle::new(key.to_path_buf(), path.clone(), fd, Some(parent.inode))
+            .map_err(open_error)?;
+        let handle = Arc::new(handle);
+        let evicted = {
+            let mut inner = self.inner.lock();
+            if let Some(existing) = inner.dirs.get(key) {
+                if existing.parent == Some(parent.inode) {
+                    return Ok(Arc::clone(existing));
+                }
+            }
+            inner.insert(key.to_path_buf(), Arc::clone(&handle))
+        };
+        // Closes the descriptors, outside the lock.
+        drop(evicted);
         Ok(handle)
     }
 }
 
 impl Inner {
-    fn insert(&mut self, key: PathBuf, handle: Arc<DirHandle>) {
-        // Second chance: a handle used since it was last examined, or dirty, is kept. Two passes
-        // clear every `used` flag, so after them only dirty handles remain and the cache grows
-        // beyond its capacity rather than dropping a change record.
+    /// Caches `handle` under `key`, replacing what was there, and returns the handles this
+    /// dropped from the cache.
+    fn insert(&mut self, key: PathBuf, handle: Arc<DirHandle>) -> Vec<Arc<DirHandle>> {
+        let mut dropped = Vec::new();
+        if self.clock.len() > 2 * self.dirs.len() {
+            self.compact();
+        }
+        // Second chance: a handle used since it was last examined, dirty, or held by an operation
+        // (every clone is made under this lock, so a count above the cache's own and this
+        // upgrade means one) is kept. Two passes clear every `used` flag, so after them only such
+        // handles remain and the cache grows beyond its capacity rather than dropping one.
         let mut examined = 0;
         while self.dirs.len() >= self.capacity && examined < 2 * self.clock.len() {
             let Some(candidate) = self.clock.pop_front() else {
                 break;
             };
-            let Some(existing) = self.dirs.get(&candidate) else {
+            let Some(existing) = candidate.upgrade() else {
                 continue;
             };
+            if !self
+                .dirs
+                .get(&existing.rel)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &existing))
+            {
+                continue;
+            }
             examined += 1;
-            if existing.used.swap(false, Ordering::Relaxed) || existing.is_dirty() {
+            if existing.used.swap(false, Ordering::Relaxed)
+                || existing.is_dirty()
+                || Arc::strong_count(&existing) > 2
+            {
                 self.clock.push_back(candidate);
                 continue;
             }
-            self.dirs.remove(&candidate);
+            dropped.extend(self.dirs.remove(&existing.rel));
         }
-        self.dirs.insert(key.clone(), handle);
-        self.clock.push_back(key);
+        self.clock.push_back(Arc::downgrade(&handle));
+        dropped.extend(self.dirs.insert(key, handle));
+        dropped
+    }
+
+    /// Drops the clock entries of handles no longer cached.
+    fn compact(&mut self) {
+        let dirs = &self.dirs;
+        self.clock.retain(|entry| {
+            entry.upgrade().is_some_and(|handle| {
+                dirs.get(&handle.rel)
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &handle))
+            })
+        });
     }
 }
 
