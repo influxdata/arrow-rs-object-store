@@ -132,6 +132,7 @@ pub(crate) enum Error {
     #[error("Unable to sync data to disk for {}: {}", path.display(), source)]
     UnableToSyncFile { source: io::Error, path: PathBuf },
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[error(
         "Unable to sync the directory holding the store root, {}: {}; \
          LocalFileSystem::with_best_effort_root_parent_sync(true) skips it",
