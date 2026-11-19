@@ -17,7 +17,7 @@
 
 //! An object store implementation for a local filesystem
 use std::fs::{File, Metadata, OpenOptions, metadata, symlink_metadata};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::FileExt;
@@ -493,7 +493,7 @@ impl ObjectStore for LocalFileSystem {
                 return durable::put(&config, best_effort_root, &path, payload, &opts.mode);
             }
             let (mut file, staging_path) = new_staged_upload(&path, fsync)?;
-            if let Err(source) = payload.iter().try_for_each(|x| file.write_all(x)) {
+            if let Err(source) = write_payload(&mut file, &payload) {
                 drop(file);
                 let _ = std::fs::remove_file(&staging_path); // Attempt to cleanup
                 return Err(Error::UnableToCopyDataToFile { source }.into());
@@ -1130,6 +1130,24 @@ fn finish_staged_hard_link(
     linked
 }
 
+/// Writes `payload` to `file` at its current position, passing the chunks together to each
+/// `write_vectored` call (one `writev` on Unix) until they are all written.
+fn write_payload(file: &mut File, payload: &PutPayload) -> io::Result<()> {
+    let mut chunks: Vec<IoSlice<'_>> = payload.iter().map(|x| IoSlice::new(x)).collect();
+    let mut chunks = chunks.as_mut_slice();
+    // Drops the empty chunks in front, as every advance drops the ones it passes.
+    IoSlice::advance_slices(&mut chunks, 0);
+    while !chunks.is_empty() {
+        match file.write_vectored(chunks) {
+            Ok(0) => return Err(io::Error::from(ErrorKind::WriteZero)),
+            Ok(written) => IoSlice::advance_slices(&mut chunks, written),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// The metadata of the staging `file` at `src`.
 fn staged_metadata(file: &File, src: &std::path::Path) -> Result<Metadata> {
     file.metadata().map_err(|e| {
@@ -1275,8 +1293,7 @@ impl MultipartUpload for LocalUpload {
                 Error::Seek { source, path }
             })?;
 
-            data.iter()
-                .try_for_each(|x| file.write_all(x))
+            write_payload(file, &data)
                 .map_err(|source| Error::UnableToCopyDataToFile { source })?;
 
             Ok(())
@@ -3082,6 +3099,58 @@ mod tests {
                 2,
                 "fsync: {fsync}"
             );
+        }
+    }
+
+    /// A payload of more chunks than one `writev` takes (`IOV_MAX`, 1024 on Linux), with empty
+    /// chunks among them, is written whole by `put`, by a create-mode `put` and by a multipart
+    /// part.
+    #[tokio::test]
+    async fn put_payload_of_many_chunks() {
+        let chunks: Vec<Bytes> = (0..3000u32)
+            .map(|i| match i % 7 {
+                0 => Bytes::new(),
+                _ => Bytes::from(i.to_string()),
+            })
+            .collect();
+        let payload: PutPayload = chunks.iter().cloned().collect();
+        let expected: Bytes = chunks.concat().into();
+        for fsync in [false, true] {
+            let root = TempDir::new().unwrap();
+            let integration = LocalFileSystem::new_with_prefix(root.path())
+                .unwrap()
+                .with_fsync(fsync);
+            for (location, mode) in [
+                ("a/overwrite", PutMode::Overwrite),
+                ("a/create", PutMode::Create),
+            ] {
+                let location = Path::from(location);
+                integration
+                    .put_opts(&location, payload.clone(), mode.into())
+                    .await
+                    .unwrap();
+                let read = integration
+                    .get(&location)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                assert_eq!(read, expected, "fsync: {fsync}");
+            }
+            let location = Path::from("a/multipart");
+            let mut upload = integration.put_multipart(&location).await.unwrap();
+            upload.put_part(payload.clone()).await.unwrap();
+            upload.put_part(payload.clone()).await.unwrap();
+            upload.complete().await.unwrap();
+            let read = integration
+                .get(&location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(read, [expected.as_ref(), expected.as_ref()].concat());
         }
     }
 

@@ -305,9 +305,7 @@ pub(super) fn put(
         let parent = last(&chain);
         let published = stage_file(cache, parent, name, path).and_then(|(mut file, staging)| {
             let staging_path = staging.path();
-            payload
-                .iter()
-                .try_for_each(|x| file.write_all(x))
+            write_payload(&mut file, &payload)
                 .map_err(|source| Error::UnableToCopyDataToFile { source })?;
             let metadata = staged_metadata(&file, &staging_path)?;
             sync_and_close(file, &staging_path, true)?;
