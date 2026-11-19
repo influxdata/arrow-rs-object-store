@@ -1,0 +1,6 @@
+# build-variants.sh / run-matrix.sh defaults
+work/
+out/
+# cargo, when built in place
+target/
+Cargo.lock
