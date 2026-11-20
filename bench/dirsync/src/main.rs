@@ -49,7 +49,8 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 usage: dirsync-bench [--flag value]...
-  --root DIR        store root; REMOVED before and after the run (default: $TMPDIR/dirsync-bench)
+  --root DIR        store root; REMOVED before and after the run (default: $TMPDIR/dirsync-bench);
+                    no `..`; after resolving symlinks it must be >= 2 levels below /
   --op OP           put | create | delete | copy | rename | multipart (default put)
   --state S         steady | shared | cold | spread (default steady)
   --depth N         directories below the root (default 3)
@@ -488,12 +489,35 @@ fn build_store(a: &Args, root: &std::path::Path) -> LocalFileSystem {
     store
 }
 
+/// `--root` made absolute, its longest existing ancestor canonicalized (symlinks resolved) and
+/// the not-yet-existing remainder appended; `..` components are rejected. All file system
+/// operations use the returned path, so the depth check below sees what is removed.
+fn resolve_root(root: &str) -> std::path::PathBuf {
+    use std::path::Component;
+    let root = std::path::absolute(root).expect("--root");
+    assert!(
+        !root.components().any(|c| c == Component::ParentDir),
+        "refusing --root {}: `..` components are not allowed",
+        root.display()
+    );
+    let mut existing = root.as_path();
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        rest.push(existing.file_name().expect("absolute path"));
+        existing = existing.parent().expect("absolute path");
+    }
+    let mut resolved = std::fs::canonicalize(existing).expect("canonicalize --root ancestor");
+    resolved.extend(rest.iter().rev());
+    resolved
+}
+
 fn main() {
     let a = Arc::new(parse());
-    let root = std::path::PathBuf::from(&a.root);
+    let root = resolve_root(&a.root);
     assert!(
         root.components().count() >= 3,
-        "refusing to remove --root {}: too close to the file system root",
+        "refusing to remove --root {} (resolves to {}): too close to the file system root",
+        a.root,
         root.display()
     );
     let _ = std::fs::remove_dir_all(&root);
