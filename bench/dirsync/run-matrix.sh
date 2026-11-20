@@ -43,7 +43,7 @@ options
   --sync-between-runs[=S]  `sync` then sleep S seconds before every run (default 3)
   --strace                 after the matrix, count syscalls per op over a fixed op count
   --strace-only            only the syscall-count pass
-  --strace-ops N           ops per traced run (default 6400; multipart N/40)
+  --strace-ops N           ops per traced run (default 6400; multipart N/40, at least 1)
   --extra "ARGS"           extra flags passed to every dirsync-bench invocation
   --out DIR                output directory (default: $OUT, else ./out next to this script)
   --work DIR               build directory of build-variants.sh (default: $WORK, else ./work)
@@ -122,6 +122,10 @@ while [ $# -gt 0 ]; do
 done
 if [ ${#variants[@]} -eq 0 ]; then usage >&2; exit 2; fi
 case $ROTATION in reverse|cycle) ;; *) echo "--rotation must be reverse or cycle" >&2; exit 2 ;; esac
+case $STRACE_OPS in
+  *[!0-9]*|"") echo "--strace-ops must be a positive integer" >&2; exit 2 ;;
+  *) if [ "$STRACE_OPS" -lt 1 ]; then echo "--strace-ops must be >= 1 (0 means unbounded)" >&2; exit 2; fi ;;
+esac
 if [ ${#cells[@]} -eq 0 ]; then cells=("${default_cells[@]}"); fi
 
 # File systems: --fs, else BENCH_ROOT_* from the environment, else one tmp entry.
@@ -217,7 +221,9 @@ strace_pass() { # fs root
   for cell in "${strace_cells[@]}"; do
     read -r op depth state size conc cleanup <<<"$cell"
     ops=$STRACE_OPS
+    # Derived budgets must stay >= 1: the driver treats --max-ops 0 as unbounded.
     if [ "$op" = multipart ]; then ops=$(( STRACE_OPS / 40 )); fi
+    if [ "$ops" -lt 1 ]; then ops=1; fi
     for label in "${labels[@]}"; do
       before_run
       if [ $DRY -eq 0 ]; then
