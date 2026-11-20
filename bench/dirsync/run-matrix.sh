@@ -51,7 +51,7 @@ options
 
 outputs (per file system label FS)
   $OUT/ops-FS.csv          one row per run; input for aggregate.py
-  $OUT/strace-FS.txt       per traced run: the CSV row and the syscall table
+  $OUT/strace-FS.txt       per traced run: the CSV row and the syscall table, or a FAILED line
   $OUT/strace-FS.csv       CSV rows of the traced runs (counts, not timings)
 EOF
 }
@@ -216,7 +216,7 @@ strace_pass() { # fs root
   local sum=$OUT/strace-$fs.txt
   local csv=$OUT/strace-$fs.csv
   local tmp=$OUT/strace-tmp-$fs.txt
-  local cell label ops op depth state size conc cleanup
+  local cell label ops op depth state size conc cleanup rc
   if [ $DRY -eq 0 ]; then : > "$sum"; fi
   for cell in "${strace_cells[@]}"; do
     read -r op depth state size conc cleanup <<<"$cell"
@@ -228,14 +228,20 @@ strace_pass() { # fs root
       before_run
       if [ $DRY -eq 0 ]; then
         echo "### $fs op $op depth $depth $state size $size conc $conc max-ops $ops variant $label fsync ${FSYNC[$label]}" >> "$sum"
+        rm -f "$tmp"
       fi
+      rc=0
       run strace -c -f -e "trace=$TRACE" -o "$tmp" "${BIN[$label]}" --root "$root/strace" --fs "$fs" \
         --variant "$label" --fsync "${FSYNC[$label]}" --op "$op" --depth "$depth" --state "$state" \
         --size "$size" --conc "$conc" --cleanup "$cleanup" \
-        --secs 1000 --warmup 0 --max-ops "$ops" --round 0 --csv "$csv" $EXTRA \
-        || echo "FAILED strace $fs $label '$cell'"
-      if [ $DRY -eq 0 ]; then
+        --secs 1000 --warmup 0 --max-ops "$ops" --round 0 --csv "$csv" $EXTRA || rc=$?
+      if [ $DRY -eq 1 ]; then continue; fi
+      # The driver appends its CSV row only on success; pair the row with the table only then.
+      if [ $rc -eq 0 ]; then
         { tail -n 1 "$csv"; cat "$tmp"; echo; } >> "$sum"
+      else
+        echo "FAILED strace $fs $label '$cell' (exit $rc)"
+        { echo "FAILED (exit $rc): no CSV row; strace table (if any) follows"; cat "$tmp" 2>/dev/null; echo; } >> "$sum"
       fi
     done
   done
