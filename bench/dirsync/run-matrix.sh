@@ -50,7 +50,9 @@ options
   --dry-run                print the commands instead of running them
 
 outputs (per file system label FS)
-  $OUT/ops-FS.csv          one row per run; input for aggregate.py
+  $OUT/ops-FS.csv          one row per run; input for aggregate.py. Repeated invocations append;
+                           each carries its own `run` id (start timestamp) and aggregate.py
+                           pairs variants within one run id and round
   $OUT/strace-FS.txt       per traced run: the CSV row and the syscall table, or a FAILED line
   $OUT/strace-FS.csv       CSV rows of the traced runs (counts, not timings)
 EOF
@@ -70,6 +72,7 @@ MATRIX=1
 STRACE_OPS=6400
 EXTRA=
 DRY=0
+RUN_ID=$(date +%Y%m%dT%H%M%S)  # written to every CSV row of this invocation (column `run`)
 fs_specs=()
 cells=()
 variants=()
@@ -201,7 +204,7 @@ matrix() { # fs root
         before_run
         run "${BIN[$label]}" --root "$root/run" --fs "$fs" --variant "$label" --fsync "${FSYNC[$label]}" \
           --op "$op" --depth "$depth" --state "$state" --size "$size" --conc "$conc" --cleanup "$cleanup" \
-          --secs "$SECS" --warmup "$WARMUP" --max-ops "$max" --round "$r" --csv "$csv" $EXTRA \
+          --secs "$SECS" --warmup "$WARMUP" --max-ops "$max" --round "$r" --run "$RUN_ID" --csv "$csv" $EXTRA \
           || echo "FAILED $fs $label '$cell' round $r"
       done
     done
@@ -234,7 +237,7 @@ strace_pass() { # fs root
       run strace -c -f -e "trace=$TRACE" -o "$tmp" "${BIN[$label]}" --root "$root/strace" --fs "$fs" \
         --variant "$label" --fsync "${FSYNC[$label]}" --op "$op" --depth "$depth" --state "$state" \
         --size "$size" --conc "$conc" --cleanup "$cleanup" \
-        --secs 1000 --warmup 0 --max-ops "$ops" --round 0 --csv "$csv" $EXTRA || rc=$?
+        --secs 1000 --warmup 0 --max-ops "$ops" --round 0 --run "$RUN_ID" --csv "$csv" $EXTRA || rc=$?
       if [ $DRY -eq 1 ]; then continue; fi
       # The driver appends its CSV row only on success; pair the row with the table only then.
       if [ $rc -eq 0 ]; then
@@ -257,7 +260,7 @@ if [ $STRACE -eq 1 ] && [ $DRY -eq 0 ]; then
 fi
 
 mkdir -p "$OUT"
-echo "start $(date +%T) load $(load); variants [${labels[*]}]; ${#cells[@]} cells; $ROUNDS rounds; rotation $ROTATION"
+echo "start $(date +%T) run $RUN_ID load $(load); variants [${labels[*]}]; ${#cells[@]} cells; $ROUNDS rounds; rotation $ROTATION"
 for spec in "${fs_specs[@]}"; do
   fs=${spec%%=*}
   root=${spec#*=}

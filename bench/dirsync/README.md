@@ -105,11 +105,16 @@ builds but accepts only `--fsync off`. Checked against 0.12.5 and 0.13.2 revs of
 
 ## Reading the results
 
-- `ops-<fs>.csv`: one row per run with `ops`, `wall_s`, `ops_per_s`, latency percentiles in
-  microseconds, the 1-minute load average at start and end, and `fsync`.
-- `aggregate.py paired`: per cell, for each pair A/B, the ratio of ops/s **within the same round**,
-  then the median and min-max over rounds, and the per-variant median p50. This is the statistic
-  to read: it cancels the drift between rounds that a shared host produces.
+- `ops-<fs>.csv`: one row per run with the cell (`op`, `depth`, `state`, `size`, `conc`,
+  `max_ops`, `cleanup`), `fsync`, `ops`, `wall_s`, `ops_per_s`, latency percentiles in
+  microseconds, the 1-minute load average at start and end, and `run`, the id of the
+  `run-matrix.sh` invocation (its start timestamp). Repeated invocations append to the file;
+  `aggregate.py` treats (`run`, `round`) as the round, rejects a duplicate (cell, variant, run,
+  round) row with an error, and reads files written before the `cleanup`/`max_ops`/`run` columns
+  existed with `?`/`?`/`0` in those fields.
+- `aggregate.py paired`: per cell, for each pair A/B, the ratio of ops/s **within the same run and
+  round**, then the median and min-max over rounds, and the per-variant median p50. This is the
+  statistic to read: it cancels the drift between rounds that a shared host produces.
 - `aggregate.py full`: medians over rounds with min-max of ops/s, p50/p99/p999, each variant's
   ratio to the baseline's median, plus two lines per file system: the load average range per
   round and the per-round normalized throughput (every run divided by its cell+variant median

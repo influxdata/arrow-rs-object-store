@@ -68,6 +68,7 @@ usage: dirsync-bench [--flag value]...
   --fs NAME         label written to the CSV (default ?)
   --variant NAME    label written to the CSV (default ?)
   --round N         label written to the CSV (default 0)
+  --run ID          label written to the CSV (default 0); run-matrix.sh passes one per invocation
   --csv FILE        append one row (header if new) to FILE (default stdout)
 ";
 
@@ -88,6 +89,7 @@ struct Args {
     cleanup: bool,
     copy_sources: u64,
     round: u32,
+    run: String,
     csv: String,
 }
 
@@ -108,6 +110,7 @@ const KNOWN: &[&str] = &[
     "cleanup",
     "copy-sources",
     "round",
+    "run",
     "csv",
 ];
 
@@ -149,6 +152,7 @@ fn parse() -> Args {
         cleanup: g("cleanup", "off") == "on",
         copy_sources: g("copy-sources", "16").parse().expect("--copy-sources"),
         round: g("round", "0").parse().expect("--round"),
+        run: g("run", "0"),
         csv: g("csv", "/dev/stdout"),
     };
     assert!(args.conc >= 1, "--conc must be >= 1");
@@ -464,12 +468,12 @@ fn write_row(a: &Args, p: &Phase, load_start: &str, load_end: &str) {
         .open(path)
         .unwrap();
     if new && a.csv != "/dev/stdout" {
-        writeln!(f, "fs,variant,op,depth,state,size,conc,round,ops,wall_s,ops_per_s,p50_us,p90_us,p99_us,p999_us,max_us,mean_us,load1_start,load1_end,fsync").unwrap();
+        writeln!(f, "fs,variant,op,depth,state,size,conc,round,ops,wall_s,ops_per_s,p50_us,p90_us,p99_us,p999_us,max_us,mean_us,load1_start,load1_end,fsync,cleanup,max_ops,run").unwrap();
     }
     let h = &p.hist;
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{:.3},{:.1},{},{},{},{},{},{:.1},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{:.3},{:.1},{},{},{},{},{},{:.1},{},{},{},{},{},{}",
         a.fs,
         a.variant,
         a.op,
@@ -490,6 +494,9 @@ fn write_row(a: &Args, p: &Phase, load_start: &str, load_end: &str) {
         load_start,
         load_end,
         if a.fsync { "on" } else { "off" },
+        if a.cleanup { "on" } else { "off" },
+        a.max_ops,
+        a.run,
     )
     .unwrap();
 }
