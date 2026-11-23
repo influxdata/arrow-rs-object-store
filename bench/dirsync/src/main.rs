@@ -53,7 +53,8 @@ usage: dirsync-bench [--flag value]...
                     no `..`; after resolving symlinks it must be >= 2 levels below /
   --op OP           put | create | delete | copy | rename | multipart (default put)
   --state S         steady | shared | cold | spread (default steady)
-  --depth N         directories below the root (default 3)
+  --depth N         directories below the root (default 3); with --conc > 1 at least 1 for
+                    steady/cold put/create/multipart and 2 for delete/copy/rename
   --size BYTES      object or part size (default 4096)
   --parts N         parts per multipart upload (default 2)
   --conc N          concurrent writers (default 1)
@@ -161,6 +162,22 @@ fn parse() -> Args {
         "unknown --state {}",
         args.state
     );
+    // Writers are told apart by the first directory of their chain (steady/cold) or by the file
+    // name (shared/spread); delete and copy/rename build that chain one level short of --depth.
+    // Shallower chains make concurrent writers target the same names.
+    if args.conc > 1 {
+        let min_depth = match args.op.as_str() {
+            "delete" | "copy" | "rename" => 2,
+            _ if ["steady", "cold"].contains(&args.state.as_str()) => 1,
+            _ => 0,
+        };
+        assert!(
+            args.depth >= min_depth,
+            "--op {} --state {} with --conc > 1 needs --depth >= {min_depth} (writers would collide)",
+            args.op,
+            args.state
+        );
+    }
     args
 }
 
