@@ -60,7 +60,8 @@ usage: dirsync-bench [--flag value]...
   --conc N          concurrent writers (default 1)
   --secs S          timed phase length (default 3)
   --warmup S        discarded warm-up length (default 0.7)
-  --max-ops N       stop after N ops in total; 0 = time-bounded (default 0; delete/rename need it)
+  --max-ops N       stop after exactly N ops in total (quotient + remainder split over writers);
+                    0 = time-bounded (default 0; delete/rename need it)
   --fsync on|off    LocalFileSystem::with_fsync (default on)
   --cleanup on|off  LocalFileSystem::with_automatic_cleanup (default off)
   --copy-sources K  copy rotates over K source files per writer (default 16)
@@ -337,7 +338,6 @@ async fn run_ops(
     secs: f64,
     max_ops: u64,
 ) -> Phase {
-    let per_writer_cap = per_writer(max_ops, a.conc);
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(secs);
     let mut handles = Vec::with_capacity(a.conc);
@@ -345,10 +345,11 @@ async fn run_ops(
         let store = Arc::clone(&store);
         let payload = payload.clone();
         let a = Arc::clone(&a);
+        let cap = quota(max_ops, a.conc, w);
         handles.push(tokio::spawn(async move {
             let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
             let mut i = start_i;
-            while Instant::now() < deadline && i - start_i < per_writer_cap {
+            while Instant::now() < deadline && i - start_i < cap {
                 let t = Instant::now();
                 one_op(&store, &a, &payload, w, i).await;
                 hist.record(t.elapsed().as_micros().clamp(1, 60_000_000) as u64)
@@ -373,12 +374,15 @@ async fn run_ops(
     }
 }
 
-fn per_writer(max_ops: u64, conc: usize) -> u64 {
+/// Op budget of writer `w` out of `conc`: the quotient of `max_ops`, plus one for the first
+/// `max_ops % conc` writers, so the budgets sum to exactly `max_ops` (a budget may be 0).
+/// `max_ops == 0` means unbounded.
+fn quota(max_ops: u64, conc: usize, w: usize) -> u64 {
     if max_ops == 0 {
-        u64::MAX
-    } else {
-        (max_ops / conc as u64).max(1)
+        return u64::MAX;
     }
+    let conc = conc as u64;
+    max_ops / conc + u64::from((w as u64) < max_ops % conc)
 }
 
 fn warm_cap(a: &Args) -> u64 {
@@ -394,10 +398,11 @@ fn prepare(store: &LocalFileSystem, a: &Args, root: &std::path::Path) {
     let fs_path = |p: &Path| store.path_to_filesystem(p).unwrap();
     match a.op.as_str() {
         "delete" | "rename" => {
-            // Enough pre-populated objects for the warm-up and the timed phase.
+            // Enough pre-populated objects for the warm-up and the timed phase, allocated per
+            // writer exactly as `run_ops` consumes them.
             assert!(a.max_ops > 0, "{} needs --max-ops", a.op);
-            let n = per_writer(warm_cap(a), a.conc) + per_writer(a.max_ops, a.conc);
             for w in 0..a.conc {
+                let n = quota(warm_cap(a), a.conc, w) + quota(a.max_ops, a.conc, w);
                 for i in 0..n {
                     let p = match a.op.as_str() {
                         "delete" => delete_path(a.depth, w, i),
