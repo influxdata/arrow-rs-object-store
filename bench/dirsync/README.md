@@ -64,7 +64,9 @@ row, so counts per op can be compared between designs (counts, not timings).
   reference runs used 6.19). `run-matrix.sh` warns below 6.6.
 - Two file systems to compare file systems (for example an xfs and an ext4 mount); a single
   directory on `$TMPDIR` is enough for a smoke test. The bench root is **removed** before and
-  after every run; never point it at a directory with data.
+  after every run; never point it at a directory with data. The driver rejects a root with `..`
+  components and resolves symlinks in the existing part of the path before checking that the
+  result is at least two levels below `/`.
 - Disk: the multipart cell writes 800 x 10 MiB per run; the delete cells pre-populate 125k files.
 
 ## Quick start
@@ -120,9 +122,12 @@ builds but accepts only `--fsync off`. Checked against 0.12.5 and 0.13.2 revs of
   round and the per-round normalized throughput (every run divided by its cell+variant median
   over rounds). A round whose normalized median is far from 1.0 was disturbed as a whole; a wide
   p10-p90 means individual cells were.
-- `strace-<fs>.txt`: per traced run the CSV row and the `strace -c` table; divide the counts by
-  `max-ops` for per-op syscalls. The driver's own preparation and teardown are included
-  (`unlinkat` from `remove_dir_all`, `openat`/`mkdir` from pre-population, `sync`).
+- `strace-<fs>.txt`: per traced run the CSV row and the `strace -c` table, or a `FAILED (exit N)`
+  line when the driver failed (no CSV row is written then); divide the counts by `max-ops` for
+  per-op syscalls (`--max-ops` is enforced exactly: quotient plus remainder spread over the
+  writers). The driver's own preparation and teardown are included (`unlinkat` from
+  `remove_dir_all`, `openat`/`mkdir` from pre-population, `sync`). The multipart budget is
+  `--strace-ops`/40, clamped to at least 1.
 
 ## Pitfalls
 
@@ -149,6 +154,11 @@ builds but accepts only `--fsync off`. Checked against 0.12.5 and 0.13.2 revs of
   for no-fsync copy at 1 writer, or skip that cell. xfs has no comparable limit.
 - **`delete` and `rename` need `--max-ops`** (pre-populated sources); delete at 100000 ops
   finishes in well under 3 s on fast disks, so its timed phase is shorter than the others.
+- **Minimum depth with more than one writer.** Writers are told apart by the first directory of
+  their chain (`steady`, `cold`) or by the file name (`shared`, `spread`); `delete` and
+  `copy`/`rename` build the chain one level short. With `--conc > 1` the driver requires
+  `--depth >= 1` for steady/cold put/create/multipart and `>= 2` for delete/copy/rename and exits
+  before touching the root otherwise.
 - **bash `set -u`** in scripts of this kind: do not reference a variable in the same `local`
   statement that declares it (`local a=$1 b=$a`); declare one per line. The scripts here follow
   that and pass shellcheck.
