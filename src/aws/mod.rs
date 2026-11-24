@@ -493,6 +493,7 @@ impl MultipartStore for AmazonS3 {
         self.client
             .request(Method::DELETE, path)
             .query(&[("uploadId", id)])
+            .idempotent(true)
             .send()
             .await?;
         Ok(())
@@ -515,14 +516,16 @@ mod tests {
     use super::*;
     use crate::ClientOptions;
     use crate::ObjectStoreExt;
+    use crate::RetryConfig;
     use crate::client::SpawnedReqwestConnector;
     use crate::client::get::GetClient;
+    use crate::client::mock_server::MockServer;
     use crate::client::retry::RetryContext;
     use crate::integration::*;
     use crate::tests::*;
     use base64::Engine;
     use base64::prelude::BASE64_STANDARD;
-    use http::HeaderMap;
+    use http::{HeaderMap, Response};
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
@@ -923,5 +926,46 @@ mod tests {
         // shutdown the io runtime and thread
         shutdown_tx.send(()).ok();
         thread_handle.join().expect("runtime thread panicked");
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_is_retried_after_timeout() {
+        let mock = MockServer::new().await;
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_endpoint(mock.url())
+            .with_skip_signature(true)
+            .with_client_options(
+                ClientOptions::new()
+                    .with_allow_http(true)
+                    .with_timeout(Duration::from_millis(100)),
+            )
+            .with_retry(RetryConfig {
+                backoff: Default::default(),
+                max_retries: 1,
+                retry_timeout: Duration::from_secs(1000),
+            })
+            .build()
+            .unwrap();
+
+        mock.push_async_fn(|_| async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            panic!()
+        });
+        mock.push_fn(|req| {
+            assert_eq!(req.method(), Method::DELETE);
+            assert_eq!(req.uri().query(), Some("uploadId=upload-1"));
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(String::new())
+                .unwrap()
+        });
+
+        store
+            .abort_multipart(&Path::from("file"), &"upload-1".to_string())
+            .await
+            .unwrap();
+        mock.shutdown().await;
     }
 }
