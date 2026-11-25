@@ -22,11 +22,12 @@ then the median and min-max of those ratios over rounds. `full`: per cell and va
 rounds of ops/s (with min-max) and of the per-round p50/p99/p999 latencies, plus per-round load and
 normalized-throughput lines that show whether a round was disturbed.
 
-A cell is `op depth state size conc max-ops cleanup`. A round is identified by the CSV columns
+A cell is `op depth state size conc max-ops cleanup chunk-size`. A round is identified by the CSV columns
 `run` (one id per run-matrix.sh invocation) and `round`, so appended repeat invocations add rounds
 instead of replacing earlier ones; rounds are printed as `r<round>` when the file holds one run id
 and `<run>.r<round>` otherwise. A duplicate (cell, variant, run, round) row is an error. CSV files
-written before the `cleanup`, `max_ops` and `run` columns existed are read with `?`, `?` and `0`.
+written before the `cleanup`, `max_ops`, `run` and `chunk_size` columns existed are read with `?`, `?`,
+`0` and `0`.
 
 usage: aggregate.py [--baseline V] [--pairs A/B,...] paired|full|both CSV...
   --baseline V   variant every other variant is paired against (default: the first variant in
@@ -40,14 +41,15 @@ from collections import defaultdict
 
 OPS = ["put", "create", "delete", "copy", "rename", "multipart"]
 STATES = {"steady": 0, "shared": 1, "cold": 2, "spread": 3}
-CELL_COLS = ["op", "depth", "state", "size", "conc", "max-ops", "cleanup"]
+CELL_COLS = ["op", "depth", "state", "size", "conc", "max-ops", "cleanup", "chunk"]
 # Columns added after the first CSVs were written, with the value used when a file lacks them.
-OPTIONAL = {"cleanup": "?", "max_ops": "?", "run": "0"}
+OPTIONAL = {"cleanup": "?", "max_ops": "?", "run": "0", "chunk_size": "0"}
 
 
 def cell_key(r):
     return (r["op"], int(r["depth"]), r["state"], int(r["size"]), int(r["conc"]),
-            r.get("max_ops", OPTIONAL["max_ops"]), r.get("cleanup", OPTIONAL["cleanup"]))
+            r.get("max_ops", OPTIONAL["max_ops"]), r.get("cleanup", OPTIONAL["cleanup"]),
+            int(r.get("chunk_size", OPTIONAL["chunk_size"])))
 
 
 def load(path):
@@ -85,16 +87,16 @@ def fmt_us(v):
 
 
 def cell_order(k):
-    return (OPS.index(k[0]) if k[0] in OPS else len(OPS), k[3], STATES.get(k[2], 9), k[1], k[4], k[5], k[6])
+    return (OPS.index(k[0]) if k[0] in OPS else len(OPS), k[3], STATES.get(k[2], 9), k[1], k[4], k[5], k[6], k[7])
 
 
 def size_s(size):
-    return {4096: "4K", 1048576: "1M", 5242880: "5M"}.get(size, str(size))
+    return {4096: "4K", 8192: "8K", 65536: "64K", 1048576: "1M", 5242880: "5M", 8388608: "8M"}.get(size, str(size))
 
 
 def cell_cols(key):
-    op, depth, state, size, conc, max_ops, cleanup = key
-    return [op, str(depth), state, size_s(size), str(conc), max_ops, cleanup]
+    op, depth, state, size, conc, max_ops, cleanup, chunk = key
+    return [op, str(depth), state, size_s(size), str(conc), max_ops, cleanup, size_s(chunk) if chunk else "one"]
 
 
 def paired(by, a, b, col="ops_per_s"):

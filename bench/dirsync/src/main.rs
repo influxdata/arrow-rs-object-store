@@ -21,6 +21,10 @@
 //! `ObjectStore` API for `secs` seconds (after a discarded warm-up) or until `max-ops` in total.
 //! One run = one CSV row. See `README.md` for the matrix driver and how to read results.
 //!
+//! `--chunk-size` builds every payload from chunks of that size (as `WriteMultipart::write` and
+//! `BufWriter` do through `PutPayloadMut`, 8 KiB blocks); the default is one chunk. The payload is
+//! built once before the warm-up and shared by the writers (`PutPayload::clone` is an `Arc` clone).
+//!
 //! Operations (`--op`):
 //! - `put`: `put` (Overwrite) of `size` bytes.
 //! - `create`: `put_opts` with `PutMode::Create`, unique names.
@@ -36,6 +40,7 @@
 //! each put creates `depth` directories), `spread` (`{prefix}/n1/pt_wal/{file}` with the prefix one
 //! of 4096 hashed values chosen per op; all 12288 directories pre-created, then `sync`).
 
+use bytes::Bytes;
 use hdrhistogram::Histogram;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
@@ -56,6 +61,9 @@ usage: dirsync-bench [--flag value]...
   --depth N         directories below the root (default 3); with --conc > 1 at least 1 for
                     steady/cold put/create/multipart and 2 for delete/copy/rename
   --size BYTES      object or part size (default 4096)
+  --chunk-size BYTES
+                    build every payload (object or part) from chunks of this size, the last one
+                    shorter if --size is not a multiple; 0 = one chunk (default 0)
   --parts N         parts per multipart upload (default 2)
   --conc N          concurrent writers (default 1)
   --secs S          timed phase length (default 3)
@@ -80,6 +88,7 @@ struct Args {
     depth: usize,
     state: String,
     size: usize,
+    chunk_size: usize,
     parts: usize,
     conc: usize,
     secs: f64,
@@ -101,6 +110,7 @@ const KNOWN: &[&str] = &[
     "depth",
     "state",
     "size",
+    "chunk-size",
     "parts",
     "conc",
     "secs",
@@ -143,6 +153,7 @@ fn parse() -> Args {
         depth: g("depth", "3").parse().expect("--depth"),
         state: g("state", "steady"),
         size: g("size", "4096").parse().expect("--size"),
+        chunk_size: g("chunk-size", "0").parse().expect("--chunk-size"),
         parts: g("parts", "2").parse().expect("--parts"),
         conc: g("conc", "1").parse().expect("--conc"),
         secs: g("secs", "3").parse().expect("--secs"),
@@ -279,6 +290,20 @@ fn create_chain_synced(root: &std::path::Path, dir: &std::path::Path) {
 fn sync_all_fs() {
     let status = std::process::Command::new("sync").status().expect("sync");
     assert!(status.success());
+}
+
+/// `size` bytes of `0xA5` as one chunk (`chunk_size == 0`) or chunks of `chunk_size` bytes, the
+/// last one `size % chunk_size` bytes when that is not 0.
+fn build_payload(size: usize, chunk_size: usize) -> PutPayload {
+    if chunk_size == 0 {
+        return PutPayload::from(vec![0xA5u8; size]);
+    }
+    let full = Bytes::from(vec![0xA5u8; chunk_size]);
+    let rest = Bytes::from(vec![0xA5u8; size % chunk_size]);
+    (0..size / chunk_size)
+        .map(|_| full.clone())
+        .chain((!rest.is_empty()).then_some(rest))
+        .collect()
 }
 
 struct Phase {
@@ -468,12 +493,12 @@ fn write_row(a: &Args, p: &Phase, load_start: &str, load_end: &str) {
         .open(path)
         .unwrap();
     if new && a.csv != "/dev/stdout" {
-        writeln!(f, "fs,variant,op,depth,state,size,conc,round,ops,wall_s,ops_per_s,p50_us,p90_us,p99_us,p999_us,max_us,mean_us,load1_start,load1_end,fsync,cleanup,max_ops,run").unwrap();
+        writeln!(f, "fs,variant,op,depth,state,size,conc,round,ops,wall_s,ops_per_s,p50_us,p90_us,p99_us,p999_us,max_us,mean_us,load1_start,load1_end,fsync,cleanup,max_ops,run,chunk_size").unwrap();
     }
     let h = &p.hist;
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{:.3},{:.1},{},{},{},{},{},{:.1},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{:.3},{:.1},{},{},{},{},{},{:.1},{},{},{},{},{},{},{}",
         a.fs,
         a.variant,
         a.op,
@@ -497,6 +522,7 @@ fn write_row(a: &Args, p: &Phase, load_start: &str, load_end: &str) {
         if a.cleanup { "on" } else { "off" },
         a.max_ops,
         a.run,
+        a.chunk_size,
     )
     .unwrap();
 }
@@ -560,7 +586,7 @@ fn main() {
     rt.block_on(async {
         let store = Arc::new(build_store(&a, &root));
         prepare(&store, &a, &root);
-        let payload = PutPayload::from(vec![0xA5u8; a.size]);
+        let payload = build_payload(a.size, a.chunk_size);
         let mut counters = vec![0u64; a.conc];
         let _warm = run_ops(
             Arc::clone(&store),

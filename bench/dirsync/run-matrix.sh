@@ -35,10 +35,13 @@ options
   --rotation reverse|cycle variant order per round: reverse = given order in odd rounds,
                            reversed in even rounds (default); cycle = rotate left by round-1 so
                            every variant runs first in turn
-  --only REGEX             keep only cells whose line "op depth state size conc max-ops cleanup"
-                           matches REGEX (grep -E); applies to the strace cells too
-  --cell "op depth state size conc max-ops cleanup"
-                           replace the default matrix cell list (not the strace cells); repeatable
+  --only REGEX             keep only cells whose line "op depth state size conc max-ops cleanup
+                           [chunk-size]" matches REGEX (grep -E); applies to the strace cells too
+  --cell "op depth state size conc max-ops cleanup [chunk-size]"
+                           replace the default matrix cell list (not the strace cells); repeatable;
+                           chunk-size is the driver's --chunk-size (default 0 = one chunk)
+  --strace-cell "op depth state size conc cleanup [chunk-size]"
+                           replace the default strace cell list; repeatable
   --secs S --warmup S      timed and warm-up phase per run (default 3 and 0.7)
   --sync-between-runs[=S]  `sync` then sleep S seconds before every run (default 3)
   --strace                 after the matrix, count syscalls per op over a fixed op count
@@ -75,6 +78,7 @@ DRY=0
 RUN_ID=$(date +%Y%m%dT%H%M%S)  # written to every CSV row of this invocation (column `run`)
 fs_specs=()
 cells=()
+strace_cells=()
 variants=()
 
 # op depth state size conc max-ops cleanup
@@ -92,13 +96,13 @@ default_cells=(
   "multipart 3 steady 5242880 1 800 off" "multipart 3 steady 5242880 8 800 off"
 )
 # Syscall-count cells: op depth state size conc cleanup; max-ops from --strace-ops.
-strace_cells=(
+default_strace_cells=(
   "put 3 steady 4096 64 off" "put 3 shared 4096 64 off" "put 3 cold 4096 64 off" "put 3 spread 4096 64 off"
   "create 3 steady 4096 64 off" "create 3 cold 4096 64 off"
   "delete 3 steady 4096 64 on" "copy 3 steady 4096 64 off" "rename 3 steady 4096 64 off"
   "multipart 3 steady 5242880 8 off"
 )
-TRACE="fsync,fdatasync,openat,open,mkdir,mkdirat,rename,renameat,link,linkat,unlink,unlinkat,rmdir,futex,fstat,newfstatat,statx"
+TRACE="fsync,fdatasync,openat,open,mkdir,mkdirat,rename,renameat,link,linkat,unlink,unlinkat,rmdir,futex,fstat,newfstatat,statx,write,writev,pwrite64,pwritev"
 
 while [ $# -gt 0 ]; do
   case $1 in
@@ -107,6 +111,7 @@ while [ $# -gt 0 ]; do
     --rotation) ROTATION=$2; shift 2 ;;
     --only) ONLY=$2; shift 2 ;;
     --cell) cells+=("$2"); shift 2 ;;
+    --strace-cell) strace_cells+=("$2"); shift 2 ;;
     --secs) SECS=$2; shift 2 ;;
     --warmup) WARMUP=$2; shift 2 ;;
     --sync-between-runs) SYNC_PAUSE=3; shift ;;
@@ -130,6 +135,7 @@ case $STRACE_OPS in
   *) if [ "$STRACE_OPS" -lt 1 ]; then echo "--strace-ops must be >= 1 (0 means unbounded)" >&2; exit 2; fi ;;
 esac
 if [ ${#cells[@]} -eq 0 ]; then cells=("${default_cells[@]}"); fi
+if [ ${#strace_cells[@]} -eq 0 ]; then strace_cells=("${default_strace_cells[@]}"); fi
 
 # File systems: --fs, else BENCH_ROOT_* from the environment, else one tmp entry.
 if [ ${#fs_specs[@]} -eq 0 ]; then
@@ -194,16 +200,18 @@ matrix() { # fs root
   local fs=$1
   local root=$2
   local csv=$OUT/ops-$fs.csv
-  local r cell label op depth state size conc max cleanup
+  local r cell label op depth state size conc max cleanup chunk
   for ((r = 1; r <= ROUNDS; r++)); do
     local -a order
     mapfile -t order < <(order_for_round "$r")
     for cell in "${cells[@]}"; do
-      read -r op depth state size conc max cleanup <<<"$cell"
+      read -r op depth state size conc max cleanup chunk <<<"$cell"
+      chunk=${chunk:-0}
       for label in "${order[@]}"; do
         before_run
         run "${BIN[$label]}" --root "$root/run" --fs "$fs" --variant "$label" --fsync "${FSYNC[$label]}" \
           --op "$op" --depth "$depth" --state "$state" --size "$size" --conc "$conc" --cleanup "$cleanup" \
+          --chunk-size "$chunk" \
           --secs "$SECS" --warmup "$WARMUP" --max-ops "$max" --round "$r" --run "$RUN_ID" --csv "$csv" $EXTRA \
           || echo "FAILED $fs $label '$cell' round $r"
       done
@@ -219,10 +227,11 @@ strace_pass() { # fs root
   local sum=$OUT/strace-$fs.txt
   local csv=$OUT/strace-$fs.csv
   local tmp=$OUT/strace-tmp-$fs.txt
-  local cell label ops op depth state size conc cleanup rc
+  local cell label ops op depth state size conc cleanup chunk rc
   if [ $DRY -eq 0 ]; then : > "$sum"; fi
   for cell in "${strace_cells[@]}"; do
-    read -r op depth state size conc cleanup <<<"$cell"
+    read -r op depth state size conc cleanup chunk <<<"$cell"
+    chunk=${chunk:-0}
     ops=$STRACE_OPS
     # Derived budgets must stay >= 1: the driver treats --max-ops 0 as unbounded.
     if [ "$op" = multipart ]; then ops=$(( STRACE_OPS / 40 )); fi
@@ -230,13 +239,13 @@ strace_pass() { # fs root
     for label in "${labels[@]}"; do
       before_run
       if [ $DRY -eq 0 ]; then
-        echo "### $fs op $op depth $depth $state size $size conc $conc max-ops $ops variant $label fsync ${FSYNC[$label]}" >> "$sum"
+        echo "### $fs op $op depth $depth $state size $size conc $conc max-ops $ops chunk-size $chunk variant $label fsync ${FSYNC[$label]}" >> "$sum"
         rm -f "$tmp"
       fi
       rc=0
       run strace -c -f -e "trace=$TRACE" -o "$tmp" "${BIN[$label]}" --root "$root/strace" --fs "$fs" \
         --variant "$label" --fsync "${FSYNC[$label]}" --op "$op" --depth "$depth" --state "$state" \
-        --size "$size" --conc "$conc" --cleanup "$cleanup" \
+        --size "$size" --conc "$conc" --cleanup "$cleanup" --chunk-size "$chunk" \
         --secs 1000 --warmup 0 --max-ops "$ops" --round 0 --run "$RUN_ID" --csv "$csv" $EXTRA || rc=$?
       if [ $DRY -eq 1 ]; then continue; fi
       # The driver appends its CSV row only on success; pair the row with the table only then.

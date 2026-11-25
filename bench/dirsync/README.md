@@ -41,19 +41,27 @@ removes that directory), `copy` (hard link into a sibling directory, rotating ov
 `--copy-sources` sources per writer), `rename` of pre-populated sources into a sibling directory,
 `multipart` (`put_multipart`, `--parts` x `put_part(--size)`, `complete`).
 
+Payloads are one chunk by default. `--chunk-size BYTES` builds every object or part from chunks of
+that size (`PutPayload` from a `Vec<Bytes>`, built once before the warm-up), the shape
+`WriteMultipart::write` and `buffered::BufWriter` produce through `PutPayloadMut` (8 KiB blocks); a
+5 MiB part from small writes is 640 chunks of 8 KiB. Use it to compare how a rev writes multi-chunk
+payloads (one `write` per chunk vs. `writev`).
+
 Layouts (`--state`): `steady` (one pre-created, fsynced chain per writer), `shared` (one chain for
 all writers), `cold` (every op creates a fresh chain of `--depth` directories), `spread`
 (`{prefix}/n1/pt_wal/{file}`, prefix one of 4096 hashed values per op; 12288 directories
 pre-created and `sync`ed, a working set larger than a 4096-entry cache).
 
-A **cell** is `op depth state size conc max-ops cleanup`; the default list in `run-matrix.sh` is
+A **cell** is `op depth state size conc max-ops cleanup [chunk-size]` (chunk-size defaults to 0 =
+one chunk); the default list in `run-matrix.sh` is
 24 cells (put steady/shared/cold at 1/8/64 writers, depth-6 cold, spread, create, delete, copy,
 rename, multipart). A **variant** is a rev built by `build-variants.sh`; a variant may also be run
 with `--fsync off` as the no-durability floor without a separate build.
 
 The optional **strace pass** runs each variant over a fixed op count under
-`strace -c -f -e trace=fsync,fdatasync,openat,...` and records the syscall table next to the CSV
-row, so counts per op can be compared between designs (counts, not timings).
+`strace -c -f -e trace=fsync,fdatasync,openat,...,write,writev,pwrite64,pwritev` and records the
+syscall table next to the CSV row, so counts per op can be compared between designs (counts, not
+timings). `--strace-cell "op depth state size conc cleanup [chunk-size]"` replaces its cell list.
 
 ## Requirements
 
@@ -108,12 +116,12 @@ builds but accepts only `--fsync off`. Checked against 0.12.5 and 0.13.2 revs of
 ## Reading the results
 
 - `ops-<fs>.csv`: one row per run with the cell (`op`, `depth`, `state`, `size`, `conc`,
-  `max_ops`, `cleanup`), `fsync`, `ops`, `wall_s`, `ops_per_s`, latency percentiles in
+  `max_ops`, `cleanup`, `chunk_size`), `fsync`, `ops`, `wall_s`, `ops_per_s`, latency percentiles in
   microseconds, the 1-minute load average at start and end, and `run`, the id of the
   `run-matrix.sh` invocation (its start timestamp). Repeated invocations append to the file;
   `aggregate.py` treats (`run`, `round`) as the round, rejects a duplicate (cell, variant, run,
-  round) row with an error, and reads files written before the `cleanup`/`max_ops`/`run` columns
-  existed with `?`/`?`/`0` in those fields.
+  round) row with an error, and reads files written before the `cleanup`/`max_ops`/`run`/
+  `chunk_size` columns existed with `?`/`?`/`0`/`0` in those fields.
 - `aggregate.py paired`: per cell, for each pair A/B, the ratio of ops/s **within the same run and
   round**, then the median and min-max over rounds, and the per-variant median p50. This is the
   statistic to read: it cancels the drift between rounds that a shared host produces.
