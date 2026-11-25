@@ -48,7 +48,9 @@ use crate::{CopyMode, CopyOptions, RenameOptions, RenameTargetMode};
 
 // With fsync enabled, writes go through cached directory handles where `ENOENT` from an entry
 // operation in a removed directory is known from the kernel sources (Linux); every other target
-// keeps the path-based code below. Every `cfg` on this condition belongs to this gate.
+// keeps the path-based code below, which fsyncs every directory from a published entry up to the
+// store root instead (see [`fsync_dirs_to_root`]). Every `cfg` on this condition belongs to this
+// gate.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod dir_cache;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -376,6 +378,10 @@ impl LocalFileSystem {
     /// are not coordinated and can return before a directory they created is durable. For the
     /// same reason, stores with different `fsync` settings must not share a root. Directories
     /// moved or re-targeted outside the store (a rename, a symlink change) are not detected.
+    ///
+    /// On other Unix targets the store keeps no such state: every durable write fsyncs each
+    /// directory from the written entry's parent up to and including the store root, so a
+    /// directory another call created or failed to fsync is covered by the next write under it.
     pub fn with_fsync(mut self, fsync: bool) -> Self {
         self.fsync = fsync;
         self
@@ -390,14 +396,35 @@ impl LocalFileSystem {
     /// every write with a sync error naming that directory. With this option such a permission
     /// error is skipped instead, and the root's directory entry may then not survive a power
     /// loss. Other errors are still reported. The option has no effect on other targets, where
-    /// the path-based code fsyncs only the directories it creates. **Disabled by default**.
+    /// the path-based code fsyncs the root's parent only when it created the root. **Disabled by
+    /// default**.
     pub fn with_best_effort_root_parent_sync(mut self, best_effort: bool) -> Self {
         self.best_effort_root_parent_sync = best_effort;
         self
     }
+
+    /// The store root when the path-based code makes writes durable (`with_fsync`): it fsyncs
+    /// the directories from a published entry's parent up to the root. `None` with `fsync` off,
+    /// and on Linux/Android, where durable writes go through the directory handles instead.
+    fn sync_root(&self) -> Result<Option<PathBuf>> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return Ok(None);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        self.fsync.then(|| self.config.root_path()).transpose()
+    }
 }
 
 impl Config {
+    /// The store root as a filesystem path
+    fn root_path(&self) -> Result<PathBuf> {
+        self.root.to_file_path().map_err(|_| {
+            Error::InvalidUrl {
+                url: self.root.clone(),
+            }
+            .into()
+        })
+    }
+
     /// Return an absolute filesystem path of the given location
     fn prefix_to_filesystem(&self, location: &Path) -> Result<PathBuf> {
         let mut url = self.root.clone();
@@ -484,6 +511,7 @@ impl ObjectStore for LocalFileSystem {
 
         let path = self.path_to_filesystem(location)?;
         let fsync = self.fsync;
+        let sync_root = self.sync_root()?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let (config, best_effort_root) =
             (Arc::clone(&self.config), self.best_effort_root_parent_sync);
@@ -499,13 +527,14 @@ impl ObjectStore for LocalFileSystem {
                 return Err(Error::UnableToCopyDataToFile { source }.into());
             }
             // Atomically publish the staged file. When fsync is enabled the publish helpers flush
-            // the file's contents and the destination's parent directory to disk first, so a
+            // the file's contents and the directories up to the store root to disk first, so a
             // successful return is durable; the fsync calls are bundled into the helpers so a
             // file-system modification can never be left unsynced. The helpers clean up the
             // staging file on failure.
+            let sync_root = sync_root.as_deref();
             let metadata = match opts.mode {
-                PutMode::Overwrite => finish_staged_rename(file, &staging_path, &path, fsync)?,
-                PutMode::Create => finish_staged_hard_link(file, &staging_path, &path, fsync)?,
+                PutMode::Overwrite => finish_staged_rename(file, &staging_path, &path, sync_root)?,
+                PutMode::Create => finish_staged_hard_link(file, &staging_path, &path, sync_root)?,
                 PutMode::Update(_) => unreachable!(),
             };
 
@@ -539,11 +568,12 @@ impl ObjectStore for LocalFileSystem {
                 maybe_spawn_blocking(move || durable::stage(&config, best_effort_root, &staged))
                     .await?;
             let staged = Staged::Durable(upload);
-            return Ok(Box::new(LocalUpload::new(staged, dest, file, true)));
+            return Ok(Box::new(LocalUpload::new(staged, dest, file, None)));
         }
+        let sync_root = self.sync_root()?;
         let (file, src) = new_staged_upload(&dest, self.fsync)?;
         let staged = Staged::Path(src);
-        Ok(Box::new(LocalUpload::new(staged, dest, file, self.fsync)))
+        Ok(Box::new(LocalUpload::new(staged, dest, file, sync_root)))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -693,6 +723,7 @@ impl ObjectStore for LocalFileSystem {
             })
             .await;
         }
+        let sync_root = self.sync_root()?;
 
         match mode {
             CopyMode::Overwrite => {
@@ -710,8 +741,8 @@ impl ObjectStore for LocalFileSystem {
                         // staging link itself needs no fsync (the publish rename below fsyncs the
                         // shared parent directory).
                         match std::fs::hard_link(&from, &staged) {
-                            // `rename` bundles in the fsync of `to`'s parent directory.
-                            Ok(_) => match rename(&staged, &to, fsync) {
+                            // `rename` bundles in the fsync of `to`'s directories.
+                            Ok(_) => match rename(&staged, &to, sync_root.as_deref()) {
                                 Ok(_) => return Ok(()),
                                 Err(source) => {
                                     // Once renamed, `staged` may already be a new upload's file.
@@ -743,8 +774,8 @@ impl ObjectStore for LocalFileSystem {
                 maybe_spawn_blocking(move || {
                     loop {
                         // The source is an existing object that is already durable, so no file
-                        // sync is needed; `hard_link` bundles in the fsync of `to`'s parent dir.
-                        match hard_link(&from, &to, fsync) {
+                        // sync is needed; `hard_link` bundles in the fsync of `to`'s directories.
+                        match hard_link(&from, &to, sync_root.as_deref()) {
                             Ok(_) => return Ok(()),
                             Err(source) => match source.kind() {
                                 ErrorKind::AlreadyExists => {
@@ -793,13 +824,14 @@ impl ObjectStore for LocalFileSystem {
                     })
                     .await;
                 }
+                let sync_root = self.sync_root()?;
                 maybe_spawn_blocking(move || {
                     loop {
                         // Unlike multipart `complete`, there is no freshly written file to
                         // `sync_all` here: `from` is an existing, already-durable object and a
                         // rename only mutates directory entries. `rename` bundles in the fsync of
-                        // both affected directories (destination, and source if it differs).
-                        match rename(&from, &to, fsync).map_err(io::Error::from) {
+                        // all affected directories (destination chain, and source if it differs).
+                        match rename(&from, &to, sync_root.as_deref()).map_err(io::Error::from) {
                             Ok(_) => return Ok(()),
                             Err(source) => match source.kind() {
                                 ErrorKind::NotFound => match from.exists() {
@@ -877,10 +909,7 @@ impl LocalFileSystem {
                 return Ok(());
             }
 
-            let root = &config.root;
-            let root = root
-                .to_file_path()
-                .map_err(|_| Error::InvalidUrl { url: root.clone() })?;
+            let root = config.root_path()?;
 
             // here we will try to traverse up and delete an empty dir if possible until we reach the root or get an error
             let mut parent = path.parent();
@@ -1004,6 +1033,15 @@ fn create_parent_dirs(path: &std::path::Path, source: io::Error, fsync: bool) ->
         dir.to_path_buf()
     });
 
+    #[cfg(test)]
+    if let Some(hook) = tests::probes::BEFORE_CREATE_DIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        hook(parent);
+    }
+
     std::fs::create_dir_all(parent).map_err(|source| {
         let path = parent.into();
         Error::UnableToCreateDir { source, path }
@@ -1029,15 +1067,20 @@ fn create_parent_dirs(path: &std::path::Path, source: io::Error, fsync: bool) ->
     Ok(())
 }
 
-/// Renames `from` to `to`, then — when `fsync` is enabled — fsyncs the destination's parent
-/// directory (and the source's too, if it differs) so the moved directory entries are durable.
+/// Renames `from` to `to`, then — when `sync_root` is given — fsyncs the directories from the
+/// destination's parent up to that store root (and the source's parent too, if it differs) so the
+/// moved directory entries are durable.
 ///
 /// The directory fsync is bundled in deliberately: every durable rename goes through here, so the
 /// post-rename fsync can never be forgotten at an individual call site.
-fn rename(from: &std::path::Path, to: &std::path::Path, fsync: bool) -> Result<(), RenameError> {
+fn rename(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    sync_root: Option<&std::path::Path>,
+) -> Result<(), RenameError> {
     std::fs::rename(from, to).map_err(RenameError::Rename)?;
-    if fsync {
-        fsync_parent_dir(to).map_err(RenameError::Fsync)?;
+    if let Some(root) = sync_root {
+        fsync_dirs_to_root(to, root).map_err(RenameError::Fsync)?;
         // A cross-directory move also removes an entry from the source directory.
         if from.parent() != to.parent() {
             fsync_parent_dir(from).map_err(RenameError::Fsync)?;
@@ -1060,14 +1103,18 @@ impl From<RenameError> for io::Error {
     }
 }
 
-/// Hard-links `original` to `link`, then — when `fsync` is enabled — fsyncs `link`'s parent
-/// directory so the new directory entry is durable.
+/// Hard-links `original` to `link`, then — when `sync_root` is given — fsyncs the directories
+/// from `link`'s parent up to that store root so the new directory entry is durable.
 ///
 /// As with [`rename`], the directory fsync is bundled in so it cannot be forgotten at a call site.
-fn hard_link(original: &std::path::Path, link: &std::path::Path, fsync: bool) -> io::Result<()> {
+fn hard_link(
+    original: &std::path::Path,
+    link: &std::path::Path,
+    sync_root: Option<&std::path::Path>,
+) -> io::Result<()> {
     std::fs::hard_link(original, link)?;
-    if fsync {
-        fsync_parent_dir(link)?;
+    if let Some(root) = sync_root {
+        fsync_dirs_to_root(link, root)?;
     }
     Ok(())
 }
@@ -1075,10 +1122,11 @@ fn hard_link(original: &std::path::Path, link: &std::path::Path, fsync: bool) ->
 /// Durably publishes the freshly-written staging file `file` (located at `src`) to `dest` via a
 /// rename.
 ///
-/// When `fsync` is enabled, the file's contents are flushed before — and `dest`'s parent
-/// directory after — the rename, so a successful return is durable. The file is always closed
-/// before the rename (checking for close errors): required for NFS error detection and for some
-/// FUSE filesystems (e.g. Blobfuse) that only commit the data on close.
+/// When `sync_root` is given, the file's contents are flushed before — and the directories from
+/// `dest`'s parent up to that store root after — the rename, so a successful return is durable.
+/// The file is always closed before the rename (checking for close errors): required for NFS
+/// error detection and for some FUSE filesystems (e.g. Blobfuse) that only commit the data on
+/// close.
 ///
 /// Returns the file's metadata. A failure before the rename succeeds removes the staging file.
 /// After a successful rename its path may already belong to a new upload, so it is left alone.
@@ -1086,14 +1134,14 @@ fn finish_staged_rename(
     file: File,
     src: &std::path::Path,
     dest: &std::path::Path,
-    fsync: bool,
+    sync_root: Option<&std::path::Path>,
 ) -> Result<Metadata> {
     let closed = staged_metadata(&file, src).and_then(|metadata| {
-        sync_and_close(file, src, fsync)?;
+        sync_and_close(file, src, sync_root.is_some())?;
         Ok(metadata)
     });
     let err = match closed {
-        Ok(metadata) => match rename(src, dest, fsync) {
+        Ok(metadata) => match rename(src, dest, sync_root) {
             Ok(()) => return Ok(metadata),
             Err(RenameError::Fsync(source)) => {
                 return Err(Error::UnableToRenameFile { source }.into());
@@ -1113,11 +1161,11 @@ fn finish_staged_hard_link(
     file: File,
     src: &std::path::Path,
     dest: &std::path::Path,
-    fsync: bool,
+    sync_root: Option<&std::path::Path>,
 ) -> Result<Metadata> {
     let linked = staged_metadata(&file, src).and_then(|metadata| {
-        sync_and_close(file, src, fsync)?;
-        hard_link(src, dest, fsync).map_err(|source| match source.kind() {
+        sync_and_close(file, src, sync_root.is_some())?;
+        hard_link(src, dest, sync_root).map_err(|source| match source.kind() {
             ErrorKind::AlreadyExists => Error::AlreadyExists {
                 path: dest.to_str().unwrap().to_string(),
                 source,
@@ -1181,6 +1229,22 @@ fn fsync_parent_dir(path: &std::path::Path) -> io::Result<()> {
     }
 }
 
+/// Fsyncs every directory from `path`'s parent up to and including the store `root`, so the entry
+/// just published at `path` and the entries of its ancestors are durable.
+///
+/// Without the directory handles of the Linux code the store does not know which ancestors still
+/// owe an fsync: one another call created and has not fsynced yet, one whose fsync failed earlier,
+/// or one recreated after a concurrent cleanup removed it. Fsyncing the whole chain covers them
+/// all. The root's parent is fsynced by [`create_parent_dirs`] when the root itself is created.
+fn fsync_dirs_to_root(path: &std::path::Path, root: &std::path::Path) -> io::Result<()> {
+    let mut dir = path.parent();
+    while let Some(d) = dir.filter(|d| d.starts_with(root)) {
+        fsync_dir(d)?;
+        dir = d.parent();
+    }
+    Ok(())
+}
+
 /// Fsyncs `dir_path` so that changes to its directory entries are durable.
 ///
 /// This is only meaningful on Unix; on other platforms (e.g. Windows) directories cannot be
@@ -1188,7 +1252,13 @@ fn fsync_parent_dir(path: &std::path::Path) -> io::Result<()> {
 fn fsync_dir(dir_path: &std::path::Path) -> io::Result<()> {
     #[cfg(target_family = "unix")]
     {
-        File::open(dir_path)?.sync_all()
+        File::open(dir_path)?.sync_all()?;
+        #[cfg(test)]
+        tests::probes::SYNCED_DIRS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir_path.to_path_buf());
+        Ok(())
     }
     #[cfg(not(target_family = "unix"))]
     {
@@ -1233,8 +1303,9 @@ struct LocalUpload {
     src: Option<Staged>,
     /// The next offset to write into the file
     offset: u64,
-    /// Whether to fsync the file and its parent directory on completion
-    fsync: bool,
+    /// The store root when a path-staged file and the directories from its parent up to the root
+    /// are fsynced on completion
+    sync_root: Option<PathBuf>,
 }
 
 /// A multipart upload's staging file.
@@ -1265,7 +1336,7 @@ struct UploadState {
 }
 
 impl LocalUpload {
-    pub(crate) fn new(src: Staged, dest: PathBuf, file: File, fsync: bool) -> Self {
+    pub(crate) fn new(src: Staged, dest: PathBuf, file: File, sync_root: Option<PathBuf>) -> Self {
         Self {
             state: Arc::new(UploadState {
                 dest,
@@ -1273,7 +1344,7 @@ impl LocalUpload {
             }),
             src: Some(src),
             offset: 0,
-            fsync,
+            sync_root,
         }
     }
 }
@@ -1304,17 +1375,19 @@ impl MultipartUpload for LocalUpload {
     async fn complete(&mut self) -> Result<PutResult> {
         let src = self.src.take().ok_or(Error::Aborted)?;
         let s = Arc::clone(&self.state);
-        let fsync = self.fsync;
+        let sync_root = self.sync_root.clone();
         maybe_spawn_blocking(move || {
             // Ensure no inflight writes
             let mut guard = s.file.lock();
             let file = guard.take().ok_or(Error::Aborted)?;
 
             // Durably publish the freshly-written staging file: flush its contents, close it, then
-            // rename it into place and fsync the destination's parent directory (the fsync calls
-            // are bundled into the helper and only run when fsync is enabled).
+            // rename it into place and fsync the destination's directories up to the store root
+            // (the fsync calls are bundled into the helper and only run when fsync is enabled).
             let metadata = match src {
-                Staged::Path(src) => finish_staged_rename(file, &src, &s.dest, fsync)?,
+                Staged::Path(src) => {
+                    finish_staged_rename(file, &src, &s.dest, sync_root.as_deref())?
+                }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Staged::Durable(upload) => upload.complete(file)?,
             };
@@ -1688,6 +1761,21 @@ mod tests {
     use crate::{ObjectStoreExt, integration::*};
 
     use super::*;
+
+    /// Probes of the path-based code.
+    pub(super) mod probes {
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+
+        /// Every directory [`fsync_dir`](super::super::fsync_dir) synced, across all tests.
+        pub(crate) static SYNCED_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+        /// Runs in [`create_parent_dirs`](super::super::create_parent_dirs) with the directory
+        /// about to be created, after the deepest existing ancestor was found.
+        #[allow(clippy::type_complexity)]
+        pub(crate) static BEFORE_CREATE_DIRS: Mutex<Option<Box<dyn FnMut(&Path) + Send>>> =
+            Mutex::new(None);
+    }
 
     #[tokio::test]
     #[cfg(target_family = "unix")]
@@ -2655,6 +2743,227 @@ mod tests {
             integration.get(&source).await.unwrap_err(),
             crate::Error::NotFound { .. }
         ));
+    }
+
+    /// The path-based code of the targets without the directory-handle cache: every durable
+    /// publish fsyncs the directories from the written entry's parent up to the store root.
+    #[cfg(all(
+        target_family = "unix",
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    mod dir_chain_tests {
+        use std::future::Future;
+
+        use super::probes::{BEFORE_CREATE_DIRS, SYNCED_DIRS};
+        use super::*;
+
+        fn fsync_store(root: &TempDir) -> LocalFileSystem {
+            LocalFileSystem::new_with_prefix(root.path())
+                .unwrap()
+                .with_fsync(true)
+        }
+
+        /// The directories under `root` fsynced so far.
+        fn synced_under(root: &std::path::Path) -> Vec<PathBuf> {
+            SYNCED_DIRS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|dir| dir.starts_with(root))
+                .cloned()
+                .collect()
+        }
+
+        /// Asserts that every directory from `file`'s parent up to `root` is in `synced`.
+        fn assert_chain_synced(synced: &[PathBuf], root: &std::path::Path, file: &std::path::Path) {
+            let mut dir = file.parent();
+            while let Some(d) = dir.filter(|d| d.starts_with(root)) {
+                assert!(
+                    synced.contains(&d.to_path_buf()),
+                    "{d:?} not synced: {synced:?}"
+                );
+                dir = d.parent();
+            }
+        }
+
+        /// Creates `location`'s directories as another call would, then runs `op` and returns the
+        /// directories it fsynced, asserting they include the chain up to the root.
+        async fn publish<T>(
+            store: &LocalFileSystem,
+            location: &str,
+            op: impl Future<Output = Result<T>>,
+        ) -> Vec<PathBuf> {
+            let root = store.config.root_path().unwrap();
+            let file = store.path_to_filesystem(&Path::from(location)).unwrap();
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let before = synced_under(&root).len();
+            op.await.unwrap();
+            let synced = synced_under(&root)[before..].to_vec();
+            assert_chain_synced(&synced, &root, &file);
+            synced
+        }
+
+        /// Runs `op` with `hook` installed as [`BEFORE_CREATE_DIRS`]. One `op` at a time.
+        async fn with_create_dirs_hook<T>(
+            hook: impl FnMut(&std::path::Path) + Send + 'static,
+            op: impl Future<Output = T>,
+        ) -> T {
+            static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _serial = ONE_AT_A_TIME.lock().await;
+            *BEFORE_CREATE_DIRS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+            let result = op.await;
+            *BEFORE_CREATE_DIRS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            result
+        }
+
+        /// Another call created the directories and has not fsynced them yet: each kind of
+        /// durable publish into them fsyncs them and every ancestor up to the root.
+        #[tokio::test]
+        async fn fsync_publish_syncs_the_directories_up_to_the_root() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let data = Bytes::from("data");
+            let path = |location: &str| store.path_to_filesystem(&Path::from(location)).unwrap();
+
+            publish(
+                &store,
+                "a/b/put",
+                store.put(&Path::from("a/b/put"), data.clone().into()),
+            )
+            .await;
+            let create = PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            };
+            publish(
+                &store,
+                "c/d/create",
+                store.put_opts(&Path::from("c/d/create"), data.clone().into(), create),
+            )
+            .await;
+            publish(
+                &store,
+                "e/f/copy",
+                store.copy(&Path::from("a/b/put"), &Path::from("e/f/copy")),
+            )
+            .await;
+            publish(
+                &store,
+                "g/h/copy",
+                store.copy_if_not_exists(&Path::from("a/b/put"), &Path::from("g/h/copy")),
+            )
+            .await;
+            // A rename also fsyncs the directory its source left.
+            let synced = publish(
+                &store,
+                "i/j/rename",
+                store.rename(&Path::from("e/f/copy"), &Path::from("i/j/rename")),
+            )
+            .await;
+            assert!(synced.contains(&path("e/f")), "{synced:?}");
+            let synced = publish(
+                &store,
+                "k/l/rename",
+                store.rename_if_not_exists(&Path::from("g/h/copy"), &Path::from("k/l/rename")),
+            )
+            .await;
+            assert!(synced.contains(&path("g/h")), "{synced:?}");
+            publish(&store, "m/n/multipart", async {
+                let mut upload = store.put_multipart(&Path::from("m/n/multipart")).await?;
+                upload.put_part(data.clone().into()).await?;
+                upload.complete().await
+            })
+            .await;
+        }
+
+        /// A creation whose directory fsync failed left `a/b` and the entry for `b` not durable;
+        /// the next write under `b` fsyncs them and the root again.
+        #[tokio::test]
+        async fn fsync_write_syncs_the_directories_a_failed_sync_left_unsynced() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let root = store.config.root_path().unwrap();
+            let file = store.path_to_filesystem(&Path::from("a/b/file")).unwrap();
+            let b = file.parent().unwrap();
+            let a = b.parent().unwrap();
+
+            // `a` can be written and searched but not opened: creating `b` in it succeeds, the
+            // fsync of `a` that follows does not.
+            fs::create_dir(a).unwrap();
+            fs::set_permissions(a, fs::Permissions::from_mode(0o300)).unwrap();
+            let err = store
+                .put(&Path::from("a/b/file"), "1".into())
+                .await
+                .unwrap_err();
+            fs::set_permissions(a, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                err.to_string().contains("Unable to sync data to disk"),
+                "{err}"
+            );
+            assert!(b.is_dir());
+            assert!(!file.exists());
+
+            let before = synced_under(&root).len();
+            store
+                .put(&Path::from("a/b/file"), "2".into())
+                .await
+                .unwrap();
+            assert_chain_synced(&synced_under(&root)[before..], &root, &file);
+        }
+
+        /// A concurrent delete with automatic cleanup removes an ancestor the creation found
+        /// existing; the creation recreates it and must sync the directory holding its entry.
+        #[tokio::test]
+        async fn fsync_creation_syncs_an_ancestor_removed_by_concurrent_cleanup() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp).with_automatic_cleanup(true);
+            let root = store.config.root_path().unwrap();
+            let file = store.path_to_filesystem(&Path::from("a/b/file")).unwrap();
+            let b = file.parent().unwrap().to_path_buf();
+            let a = b.parent().unwrap().to_path_buf();
+
+            store.put(&Path::from("a/other"), "1".into()).await.unwrap();
+            let before = synced_under(&root).len();
+
+            // Right before `b` is created, the delete of `a/other` with automatic cleanup removes
+            // `a`, which the creation found existing.
+            let (removed, creating) = (a.clone(), b.clone());
+            let mut done = false;
+            with_create_dirs_hook(
+                move |dir| {
+                    if dir == creating && !done {
+                        done = true;
+                        fs::remove_file(removed.join("other")).unwrap();
+                        fs::remove_dir(&removed).unwrap();
+                    }
+                },
+                store.put(&Path::from("a/b/file"), "2".into()),
+            )
+            .await
+            .unwrap();
+
+            assert!(file.exists());
+            assert_chain_synced(&synced_under(&root)[before..], &root, &file);
+        }
+
+        /// The chain fsync reports an ancestor it cannot open, after the entry is in place.
+        #[tokio::test]
+        async fn fsync_publish_reports_an_ancestor_it_cannot_open() {
+            let tmp = TempDir::new().unwrap();
+            let store = fsync_store(&tmp);
+            let file = store.path_to_filesystem(&Path::from("a/b/file")).unwrap();
+            let a = file.parent().unwrap().parent().unwrap();
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+
+            fs::set_permissions(a, fs::Permissions::from_mode(0o300)).unwrap();
+            let err = store
+                .put(&Path::from("a/b/file"), "1".into())
+                .await
+                .unwrap_err();
+            fs::set_permissions(a, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(err.to_string().contains("Unable to rename file"), "{err}");
+            assert_eq!(fs::read(&file).unwrap(), b"1");
+        }
     }
 
     #[test]
